@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""dvm-run - run one script inside a fresh Qubes disposable, over qubes.VMShell.
+
+Purpose-built for the magic-wormhole project. This is deliberately NOT a
+general registry/address harness: an address abstraction that exists for
+exactly one address is not an abstraction. It dials dispvm targets only, and
+encodes the three rules a disposable imposes:
+
+  * One call, foreground, held open. For a disposable the call returning IS the
+    VM being destroyed, so detach-and-poll is structurally impossible.
+  * The payload runs with stdin on /dev/null. qubes.VMShell is `exec /bin/bash`
+    with the script on its own fd 0, so a payload that reads stdin swallows the
+    rest of the script. The symptom is exit 0 with no output and no error, which
+    is nearly impossible to diagnose after the fact.
+  * A timeout is mandatory. An unbounded payload pins the disposable and the
+    blocking call forever, and there is no rescue path for a machine that no
+    longer exists.
+
+Every run is journalled under journal/.
+"""
+
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import secrets
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+JOURNAL = ROOT / "journal"
+SERVICE = "qubes.VMShell"
+# Only dispvm forms. Not a general address parser -- naming @anyvm, a concrete
+# VM, or anything with a path separator is a bug in the caller, not a feature.
+TARGET_RE = re.compile(r"^@dispvm(:[A-Za-z0-9][A-Za-z0-9_.-]*)?$")
+CLIENT = "/usr/lib/qubes/qrexec-client-vm"
+
+# The script that actually crosses the wire. It decodes the payload to a file
+# and runs it from there, so the payload gets its own stdin (/dev/null) and a
+# `set -euo pipefail` inside it behaves.
+WRAPPER = """set -uo pipefail
+P="$(mktemp)"
+base64 -d > "$P" <<'__DVM_PAYLOAD__'
+{b64}
+__DVM_PAYLOAD__
+echo "### disposable: $(hostname)" >&2
+rc=0
+timeout -k 10 {timeout} bash "$P" < /dev/null || rc=$?
+rm -f "$P"
+exit $rc
+"""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--label", required=True,
+                    help="why this ran; an unlabelled journal entry is a defect")
+    ap.add_argument("--timeout", type=int, default=120,
+                    help="seconds the payload may run in the disposable")
+    ap.add_argument("--target", default="@dispvm",
+                    help="@dispvm, or @dispvm:<dvm-template>. Name the template "
+                         "explicitly ONLY if dom0 policy also names it: a bare "
+                         "@dispvm rule denies a caller that names one.")
+    src = ap.add_mutually_exclusive_group()
+    src.add_argument("-c", "--command", help="payload as a string")
+    src.add_argument("-f", "--file", help="payload from a file")
+    args = ap.parse_args()
+
+    if not TARGET_RE.match(args.target):
+        print(f"dvm-run: refusing target {args.target!r}; "
+              f"expected @dispvm or @dispvm:<dvm-template>", file=sys.stderr)
+        return 2
+
+    if args.command:
+        payload = args.command
+    elif args.file:
+        payload = pathlib.Path(args.file).read_text()
+    else:
+        payload = sys.stdin.read()
+    if not payload.strip():
+        print("dvm-run: empty payload", file=sys.stderr)
+        return 2
+
+    b64 = base64.b64encode(payload.encode()).decode()
+    wrapper = WRAPPER.format(
+        b64="\n".join(b64[i:i + 76] for i in range(0, len(b64), 76)),
+        timeout=args.timeout,
+    )
+
+    runid = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(2)
+    raw = JOURNAL / "raw" / runid
+    raw.mkdir(parents=True, exist_ok=True)
+
+    argv = [CLIENT, "--no-filter-escape-chars-stdout",
+            "--no-filter-escape-chars-stderr", "--", args.target, SERVICE]
+
+    started = time.monotonic()
+    timed_out = False
+    try:
+        # Killing this end kills the remote and dom0 destroys the disposable,
+        # so the local timeout is also the teardown. Give the remote timeout a
+        # head start so we see its exit code rather than shooting the vchan.
+        proc = subprocess.run(argv, input=wrapper.encode(),
+                              capture_output=True, timeout=args.timeout + 15)
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        timed_out = True
+        rc, out, err = 124, e.stdout or b"", e.stderr or b""
+
+    duration_ms = int((time.monotonic() - started) * 1000)
+
+    (raw / "script").write_text(payload)
+    (raw / "stdout").write_bytes(out)
+    (raw / "stderr").write_bytes(err)
+    meta = {
+        "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "runid": runid, "target": args.target, "service": SERVICE,
+        "label": args.label, "exit": rc, "timed_out": timed_out,
+        "refused": rc == 126 and b"Request refused" in err,
+        "duration_ms": duration_ms,
+        "script_sha256": hashlib.sha256(payload.encode()).hexdigest(),
+        "stdout_bytes": len(out), "stderr_bytes": len(err),
+        "raw": f"journal/raw/{runid}",
+    }
+    (raw / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    month = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m")
+    with (JOURNAL / f"{month}.jsonl").open("a") as fh:
+        fh.write(json.dumps(meta) + "\n")
+
+    sys.stdout.write(out.decode(errors="replace"))
+    sys.stderr.write(err.decode(errors="replace"))
+    if meta["refused"]:
+        print(f"\ndvm-run: dom0 REFUSED {SERVICE} to {args.target}. "
+              f"This is policy, not the target; retrying cannot help.",
+              file=sys.stderr)
+    if timed_out:
+        print(f"\ndvm-run: local timeout after {args.timeout + 15}s; "
+              f"vchan dropped, disposable destroyed.", file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

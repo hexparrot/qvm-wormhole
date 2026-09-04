@@ -1,0 +1,18 @@
+# dom0: /etc/qubes/policy.d/30-wormhole.policy
+# Sorts before 90-default.policy, which denies everything.
+#
+# THIS FILE is what confers the capability. qvm-wormhole ships to every qube
+# inheriting the template, but it is inert without a line here: an ungranted
+# caller gets rc 126 "Request refused" and no disposable is ever created.
+# Install broadly, grant narrowly.
+#
+# The TARGET must name the DVM template. A bare `@dispvm` rule REFUSES a caller
+# that names one -- verified against live dom0, not just the policy parser.
+
+wormhole.Send  +file  personal  @dispvm:wormhole_dvm  allow
+
+# Add one line per additional sender, e.g.:
+# wormhole.Send  +file  personal  @dispvm:wormhole_dvm  allow
+
+# Catch-all. Must be last. Denies every unlisted verb and every unlisted caller.
+wormhole.Send  *      @anyvm    @anyvm                deny

@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""wormhole.Send - qrexec service. Sends one file out via magic-wormhole.
+
+Runs inside a DispVM. Install into the DVM TEMPLATE's /usr/local/etc/qubes-rpc/,
+which rides its private volume and is inherited by every disposable.
+
+    caller  --> qrexec  wormhole.Send+file  --> this handler
+                stdin: one JSON header line, then exactly `size` raw bytes
+                stdout: one JSON status object per line
+
+This service DELIBERATELY reads stdin, which inverts invariant 4 of the
+qubes-rpc-service pattern ("nothing in the handler may read it"). That invariant
+exists to stop caller-supplied text becoming code. That property is preserved
+here by different means, and the difference is the whole security argument:
+
+  * The qrexec ARGUMENT is still a fixed verb table -- `file` and nothing else.
+    Everything variable rides in the header, where it is parsed and validated.
+  * There is no shell anywhere in this handler. wormhole is invoked with an argv
+    LIST via subprocess, so header fields are arguments, never syntax.
+  * Every header field is validated fail-closed before use, and `filename` is
+    reduced to a basename so a caller cannot choose a path.
+  * Exactly `size` bytes are read and no more, so the service never depends on
+    EOF or a half-closed vchan.
+
+SIZE_CAP is the authoritative ceiling; the client's --size-cap can only be more
+restrictive, never less. It defaults to 2 GiB because that is the Qubes default
+private-volume size -- a larger cap needs a larger volume on the DVM template.
+Override with WORMHOLE_SEND_SIZE_CAP.
+"""
+
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import syslog
+
+VERBS = {"file"}
+MAX_HEADER = 8192
+SIZE_CAP = int(os.environ.get("WORMHOLE_SEND_SIZE_CAP", 2 * 1024**3))
+HEADROOM = 16 * 1024**2          # leave room for logs etc. on the private volume
+CODE_RE = re.compile(r"^[0-9]{1,6}(-[a-z]+){2,}$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+WORK = pathlib.Path(os.path.expanduser("~/qvm-wormhole-in"))
+
+WORMHOLE_PATHS = [
+    # Explicit override first: lets an operator with a different install layout
+    # point at it, and lets the tests substitute a recording shim.
+    os.environ.get("WORMHOLE_SEND_BIN"),
+    os.path.expanduser("~/.local/bin/wormhole"),
+    os.path.expanduser("~/.local/share/pipx/venvs/magic-wormhole/bin/wormhole"),
+    "/opt/wormhole/bin/wormhole",
+    "/usr/bin/wormhole",
+]
+
+
+def say(**kw):
+    sys.stdout.write(json.dumps(kw) + "\n")
+    sys.stdout.flush()
+
+
+def die(message, rc=2):
+    say(status="error", message=message)
+    syslog.syslog(syslog.LOG_WARNING, "refused: %s" % message)
+    sys.exit(rc)
+
+
+def strict_int(value, what):
+    """JSON gives us bools and floats too. `size: 64.9` silently truncating to
+    64 would desynchronise the byte count from the sender's."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        die("%s must be an integer, got %r" % (what, value))
+    return value
+
+
+def read_header(stream):
+    """Bounded readline. An unbounded one is a memory DoS from a caller that
+    never sends a newline."""
+    buf = bytearray()
+    while len(buf) < MAX_HEADER:
+        b = stream.read(1)
+        if not b:
+            die("stdin closed before the header was complete")
+        if b == b"\n":
+            return bytes(buf)
+        buf += b
+    die("header exceeded %d bytes" % MAX_HEADER)
+
+
+def safe_name(raw):
+    """A caller may influence the file's NAME but never its PATH."""
+    name = os.path.basename(str(raw))
+    if not name or name in (".", "..") or name.startswith("-"):
+        return "received.bin"
+    if "/" in name or "\0" in name or any(ord(c) < 32 for c in name):
+        return "received.bin"
+    return name[:200]
+
+
+def find_wormhole():
+    for p in WORMHOLE_PATHS:
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    die("no wormhole binary found in this disposable; the DVM template is not "
+        "provisioned (looked in: %s)" % ", ".join(p for p in WORMHOLE_PATHS if p),
+        rc=1)
+
+
+def main():
+    syslog.openlog("wormhole.Send")
+    arg = os.environ.get("QREXEC_SERVICE_ARGUMENT") or (
+        sys.argv[1] if len(sys.argv) > 1 else "")
+    peer = os.environ.get("QREXEC_REMOTE_DOMAIN", "?")
+    syslog.syslog(syslog.LOG_INFO, "verb=%s from=%s" % (arg or "<none>", peer))
+
+    if arg not in VERBS:
+        print("wormhole.Send: refused argument %r (want %s)"
+              % (arg, "|".join(sorted(VERBS))), file=sys.stderr)
+        sys.exit(2)
+
+    stream = sys.stdin.buffer
+    try:
+        header = json.loads(read_header(stream).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        die("unparseable header: %s" % e)
+    if not isinstance(header, dict):
+        die("header is not an object")
+
+    code = str(header.get("code", ""))
+    if not CODE_RE.match(code):
+        die("malformed code")
+    size = strict_int(header.get("size", -1), "size")
+    if not 0 < size <= SIZE_CAP:
+        die("size %d outside 1..%d" % (size, SIZE_CAP))
+    digest = str(header.get("sha256", ""))
+    if not SHA_RE.match(digest):
+        die("malformed sha256")
+    timeout = max(60, min(strict_int(header.get("timeout", 3600), "timeout"), 86400))
+
+    name = safe_name(header.get("filename", ""))
+    try:
+        WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as e:
+        die("cannot create the work directory: %s" % e, rc=1)
+
+    # Refuse before reading gigabytes we cannot store. A disposable's private
+    # volume is a copy of the DVM template's, 2 GiB by Qubes default.
+    try:
+        st = os.statvfs(WORK)
+        free = st.f_bavail * st.f_frsize
+        if size + HEADROOM > free:
+            die("not enough room in this disposable: need %d bytes, %d free. "
+                "Raise the DVM template's private volume, or lower the cap."
+                % (size, free), rc=1)
+    except OSError:
+        pass                      # statvfs failing is not itself a reason to stop
+
+    dest = WORK / name
+    try:
+        # Read EXACTLY size bytes. Never trust EOF, never read past the
+        # declaration.
+        h = hashlib.sha256()
+        remaining = size
+        try:
+            with dest.open("wb") as fh:
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        die("stdin ended %d bytes early" % remaining, rc=1)
+                    fh.write(chunk)
+                    h.update(chunk)
+                    remaining -= len(chunk)
+        except OSError as e:
+            die("could not store the payload: %s" % e, rc=1)
+        if h.hexdigest() != digest:
+            die("sha256 mismatch after transfer", rc=1)
+
+        host = os.uname().nodename
+        say(status="received", host=host, bytes=size, name=name)
+
+        wormhole = find_wormhole()
+        # argv LIST -- no shell, so `code` and `dest` are arguments, not syntax.
+        argv = [wormhole, "send", "--code", code, "--no-qr", "--hide-progress",
+                str(dest)]
+        say(status="sending", host=host)
+        try:
+            proc = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                                  capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            die("wormhole did not finish within %ds -- the receiver may never "
+                "have run, or the transfer was too slow to complete" % timeout,
+                rc=124)
+        except OSError as e:
+            die("could not run %s: %s" % (wormhole, e), rc=1)
+
+        if proc.returncode != 0:
+            tail = (proc.stderr or b"").decode(errors="replace").strip()
+            # wormhole reports progress AND the code on stderr, so the tail is
+            # the useful part of a failure.
+            die(tail.splitlines()[-1] if tail
+                else "wormhole exited %d" % proc.returncode, rc=1)
+
+        say(status="complete", host=host)
+        syslog.syslog(syslog.LOG_INFO,
+                      "sent %s (%d bytes) for %s" % (name, size, peer))
+        return 0
+    finally:
+        # Every exit path, not just the happy one. Moot in a true disposable,
+        # but this handler also gets exercised in the DVM template itself.
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
