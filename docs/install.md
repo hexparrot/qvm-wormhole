@@ -87,10 +87,14 @@ Nothing works yet, by design. Create `/etc/qubes/policy.d/30-wormhole.policy`
 
 ```
 wormhole.Send  +file  personal  @dispvm:wormhole_dvm  allow
+wormhole.Recv  +file  personal  @dispvm:wormhole_dvm  allow
 wormhole.Send  *      @anyvm    @anyvm                deny
+wormhole.Recv  *      @anyvm    @anyvm                deny
 ```
 
-One `allow` line per qube that may send. The catch-all `deny` goes last.
+One `allow` line per qube **per direction**; the catch-all `deny`s go last.
+Grant the two directions separately — `Send` moves data out, `Recv` brings
+untrusted data in, and a given qube may warrant one but not the other.
 
 **The target must name the template.** A bare `@dispvm` rule *refuses* a caller
 that names one, and the resulting rc 126 is indistinguishable from having no
@@ -106,6 +110,15 @@ qvm-wormhole /tmp/t.txt
 
 It prints a code and the exact `wormhole receive <code>` line. Run that on the
 other computer. You should see `Transfer complete.`
+
+Then the other direction — run `wormhole send somefile` on the other computer
+and feed its code to:
+
+```
+qvm-wormhole-recv
+```
+
+The file lands in `~/QubesIncoming/wormhole/`.
 
 ## 7. Verify the blast radius — in an **ungranted** AppVM
 

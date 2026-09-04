@@ -17,201 +17,75 @@ disposable is ever created.
 """
 
 import argparse
-import hashlib
 import json
 import os
 import pathlib
-import re
-import secrets
 import subprocess
 import sys
-import threading
 import time
 
+for _p in (os.environ.get("QVM_WORMHOLE_LIB"), "/usr/share/qvm-wormhole",
+           str(pathlib.Path(__file__).resolve().parent.parent / "share")):
+    if _p and os.path.isfile(os.path.join(_p, "qvmwh.py")):
+        sys.path.insert(0, _p)
+        break
+import qvmwh  # noqa: E402
+
+PROG = "qvm-wormhole"
 SERVICE = "wormhole.Send"
 VERB = "file"
-CLIENT = os.environ.get("QVM_WORMHOLE_QREXEC", "/usr/lib/qubes/qrexec-client-vm")
-CONF = "/etc/qvm-wormhole.conf"
-STATE = pathlib.Path(os.path.expanduser("~/.local/state/qvm-wormhole"))
-CHUNK = 1024 * 1024
-MAX_TIMEOUT = 86400
-
-# @dispvm, @dispvm:<template>, or a plain VM name -- fully anchored. An
-# unanchored alternation here would accept anything merely STARTING with
-# "dispvm", which dom0 then refuses with a misleading diagnosis.
-DVM_RE = re.compile(
-    r"^(@dispvm(:[A-Za-z0-9][A-Za-z0-9_.-]*)?|[A-Za-z0-9][A-Za-z0-9_.-]*)$")
-
-DEFAULTS = {
-    "dvm": "wormhole_dvm",
-    "size_cap": str(2 * 1024**3),
-    "timeout": "3600",
-}
-
-WORDLIST_PATHS = [
-    os.environ.get("QVM_WORMHOLE_WORDLIST"),
-    "/usr/share/qvm-wormhole/wordlist.txt",
-    str(pathlib.Path(__file__).resolve().parent.parent / "share" / "wordlist.txt"),
-]
-
-
-def fail(message):
-    """Exit 2 for anything the caller got wrong.
-
-    The exit codes are a contract: 0 sent, 1 the transfer failed, 2 bad input,
-    124 timed out, 126 dom0 refused, 130 cancelled. Callers branch on these, so
-    a validation error must not look like a failed transfer.
-    """
-    print("qvm-wormhole: " + message, file=sys.stderr)
-    sys.exit(2)
-
-
-def load_conf():
-    """Config precedence: built-in defaults < /etc conf < QVM_WORMHOLE_* env."""
-    conf = dict(DEFAULTS)
-    try:
-        for line in pathlib.Path(CONF).read_text().splitlines():
-            line = line.split("#", 1)[0].strip()
-            if not line or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip().lower()
-            if k in conf:
-                conf[k] = v.strip()
-    except FileNotFoundError:
-        pass
-    for k in conf:
-        env = os.environ.get("QVM_WORMHOLE_" + k.upper())
-        if env:
-            conf[k] = env
-    return conf
-
-
-def conf_int(conf, key):
-    """A malformed /etc value must not crash --help with a traceback."""
-    try:
-        return int(conf[key])
-    except (TypeError, ValueError):
-        fail("%s: %r is not an integer (check %s or QVM_WORMHOLE_%s)"
-             % (key, conf[key], CONF, key.upper()))
-
-
-def load_wordlist():
-    """The PGP even/odd lists, extracted from magic-wormhole itself.
-
-    Shipped as data so this qube needs no wormhole install to mint a code.
-    """
-    for p in WORDLIST_PATHS:
-        if not p:
-            continue
-        try:
-            text = pathlib.Path(p).read_text()
-        except OSError:
-            continue
-        section, words = None, {"even": [], "odd": []}
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line == "[even]":
-                section = "even"
-            elif line == "[odd]":
-                section = "odd"
-            elif section:
-                words[section].append(line)
-        if len(words["even"]) >= 16 and len(words["odd"]) >= 16:
-            return words
-    fail("no usable wordlist found; looked in "
-         + ", ".join(p for p in WORDLIST_PATHS if p))
-
-
-def mint_code(words):
-    """A 5-digit nameplate widens the space against collisions on the public
-    relay. Entropy comes from secrets -- never from a caller, a clock, or a
-    language model.
-
-    Words are lowercased. The PGP list ships mixed case ("Aztec", "Chicago"),
-    and the code IS the PAKE password: if we mint "Aztec" and the human at the
-    other end types "aztec", the two sides derive different keys and the
-    transfer fails with a wrong-password error that looks like an attack. One
-    canonical case removes the whole class.
-    """
-    nameplate = secrets.randbelow(90000) + 10000
-    return "%d-%s-%s" % (nameplate,
-                         secrets.choice(words["even"]).lower(),
-                         secrets.choice(words["odd"]).lower())
-
-
-def sha256_of(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(CHUNK), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def journal(record):
-    """Audit lives HERE, not on the target: a disposable's journal dies with the
-    disposable. The full code is deliberately not recorded -- only its nameplate.
-    """
-    try:
-        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with (STATE / "journal.jsonl").open("a") as fh:
-            fh.write(json.dumps(record) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-    except OSError as e:
-        print("qvm-wormhole: warning: could not journal: %s" % e, file=sys.stderr)
 
 
 def main():
-    conf = load_conf()
+    conf = qvmwh.load_conf()
     ap = argparse.ArgumentParser(
-        prog="qvm-wormhole",
+        prog=PROG,
         description="Send one file out of this qube via a disposable VM.")
     ap.add_argument("file", help="the file to send")
     ap.add_argument("--dvm", default=conf["dvm"],
                     help="DispVM template to spawn (default: %(default)s). Must "
                          "match the dom0 policy line.")
-    ap.add_argument("--timeout", type=int, default=conf_int(conf, "timeout"),
+    ap.add_argument("--timeout", type=int, default=qvmwh.conf_int(conf, "timeout"),
                     help="seconds allowed for the whole transfer, including the "
                          "wait for a receiver (default: %(default)s)")
-    ap.add_argument("--size-cap", type=int, default=conf_int(conf, "size_cap"),
+    ap.add_argument("--size-cap", type=int,
+                    default=qvmwh.conf_int(conf, "size_cap"),
                     help="refuse files larger than this many bytes")
     args = ap.parse_args()
 
-    if not DVM_RE.match(args.dvm):
-        fail("refusing dvm name %r" % args.dvm)
-    if not 1 <= args.timeout <= MAX_TIMEOUT:
-        fail("--timeout must be between 1 and %d seconds" % MAX_TIMEOUT)
+    if not qvmwh.DVM_RE.match(args.dvm):
+        qvmwh.fail("refusing dvm name %r" % args.dvm, PROG)
+    if not 1 <= args.timeout <= qvmwh.MAX_TIMEOUT:
+        qvmwh.fail("--timeout must be between 1 and %d seconds"
+                   % qvmwh.MAX_TIMEOUT, PROG)
     if args.size_cap < 1:
-        fail("--size-cap must be positive")
+        qvmwh.fail("--size-cap must be positive", PROG)
 
     src = pathlib.Path(args.file).expanduser()
     try:
         real = src.resolve(strict=True)
     except OSError as e:
-        fail(str(e))
+        qvmwh.fail(str(e), PROG)
     if not real.is_file():
-        fail("not a regular file: %s" % real)
+        qvmwh.fail("not a regular file: %s" % real, PROG)
     size = real.stat().st_size
     if size == 0:
-        fail("refusing to send an empty file")
+        qvmwh.fail("refusing to send an empty file", PROG)
     if size > args.size_cap:
-        fail("%s is %d bytes, over the %d cap (--size-cap)"
-             % (real, size, args.size_cap))
+        qvmwh.fail("%s is %d bytes, over the %d cap (--size-cap)"
+                   % (real, size, args.size_cap), PROG)
 
     # Mint and show the code BEFORE hashing: they are independent, and hashing a
     # multi-gigabyte file off slow media would otherwise leave the user staring
     # at nothing while the receiver waits to be told what to type.
-    code = mint_code(load_wordlist())
+    code = qvmwh.mint_code(qvmwh.load_wordlist())
     print("Wormhole code: %s" % code)
     print()
     print("On the receiving computer, run:")
     print("    wormhole receive %s" % code)
     print(flush=True)
 
-    digest = sha256_of(real)
+    digest = qvmwh.sha256_of(real)
     header = json.dumps({
         "filename": real.name,
         "size": size,
@@ -220,42 +94,23 @@ def main():
         "timeout": args.timeout,
     }, sort_keys=True)
 
-    target = args.dvm if args.dvm.startswith("@") else "@dispvm:" + args.dvm
+    target = qvmwh.target_for(args.dvm)
     print("Sending %s (%d bytes) via a %s disposable." % (real.name, size, target))
     print("Waiting for the receiver -- Ctrl-C to cancel.", flush=True)
 
-    argv = [CLIENT, "--no-filter-escape-chars-stdout",
-            "--no-filter-escape-chars-stderr", "--",
-            target, "%s+%s" % (SERVICE, VERB)]
-
     started = time.time()
     status = {"status": "no-reply"}
-    try:
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError as e:
-        fail("cannot run %s: %s" % (CLIENT, e))
+    proc = qvmwh.spawn(target, SERVICE, VERB, PROG)
 
-    def drain():
-        # Read concurrently with writing. The service is specified not to speak
-        # until it has consumed the payload, but draining anyway removes a whole
-        # class of pipe-buffer deadlocks rather than trusting that contract.
-        for raw in proc.stdout:
-            try:
-                msg = json.loads(raw.decode(errors="replace"))
-            except ValueError:
-                continue
-            status.update(msg)
-            if msg.get("status") == "received":
-                print("Disposable %s has the file." % msg.get("host", "?"),
-                      flush=True)
-            elif msg.get("status") == "complete":
-                print("Transfer complete.", flush=True)
-            elif msg.get("status") == "error":
-                print("Failed: %s" % msg.get("message", "?"), file=sys.stderr)
+    def show(msg):
+        if msg.get("status") == "received":
+            print("Disposable %s has the file." % msg.get("host", "?"), flush=True)
+        elif msg.get("status") == "complete":
+            print("Transfer complete.", flush=True)
+        elif msg.get("status") == "error":
+            print("Failed: %s" % msg.get("message", "?"), file=sys.stderr)
 
-    reader = threading.Thread(target=drain, daemon=True)
-    reader.start()
+    reader = qvmwh.drain_status(proc, status, show)
 
     sent = 0
     cancelled = False
@@ -266,7 +121,7 @@ def main():
         proc.stdin.write((header + "\n").encode())
         with open(real, "rb") as fh:
             while sent < size:
-                chunk = fh.read(min(CHUNK, size - sent))
+                chunk = fh.read(min(qvmwh.CHUNK, size - sent))
                 if not chunk:
                     short_read = True          # the file shrank under us
                     break
@@ -323,39 +178,34 @@ def main():
                 pass
 
     if stream_err is not None:
-        print("qvm-wormhole: could not read %s: %s" % (real, stream_err),
+        print("%s: could not read %s: %s" % (PROG, real, stream_err),
               file=sys.stderr)
         rc = 1
     elif b"Request refused" in err:
         # Checked BEFORE the short-send case: when the peer dies early the byte
         # count is a symptom, not the cause, and blaming the file would send
         # someone hunting a disk problem that does not exist.
-        # Key on the message, not on rc 126 alone: an exec failure inside the
-        # disposable can also surface as 126 and is a different problem.
-        print("qvm-wormhole: dom0 refused %s to %s.\n"
-              "This qube has no policy line for that target; retrying cannot "
-              "help, and no disposable was created." % (SERVICE, target),
-              file=sys.stderr)
+        print(qvmwh.refusal_note(SERVICE, target, PROG), file=sys.stderr)
         rc = 126
     elif short_read and not cancelled:
-        print("qvm-wormhole: %s changed while sending (%d of %d bytes); "
-              "nothing was offered to a receiver." % (real, sent, size),
-              file=sys.stderr)
+        print("%s: %s changed while sending (%d of %d bytes); nothing was "
+              "offered to a receiver." % (PROG, real, sent, size), file=sys.stderr)
         rc = 1
     elif broken_pipe and rc == 0:
-        print("qvm-wormhole: the disposable closed the connection early",
+        print("%s: the disposable closed the connection early" % PROG,
               file=sys.stderr)
         rc = 1
     elif err.strip() and rc not in (0, 130):
         sys.stderr.write(err.decode(errors="replace"))
 
-    journal({
+    qvmwh.journal({
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "direction": "send",
         "path": str(real), "size": size, "sent": sent, "sha256": digest,
         "nameplate": code.split("-", 1)[0], "dvm": args.dvm,
         "disposable": status.get("host"), "status": status.get("status"),
         "exit": rc, "duration_s": round(time.time() - started, 1),
-    })
+    }, PROG)
     return rc
 
 

@@ -56,6 +56,25 @@ watching in real time, but that is a convenience, not the record.
 Only the **nameplate** is journalled, never the full code. A single-use secret
 written to a logfile outlives its use.
 
+## Receiving: why the file comes back on stdout
+
+A qrexec call is bidirectional, so `wormhole.Recv` streams the received file
+back up the call the caller already opened. The consequences are the whole
+reason the design looks like this:
+
+- **No `qubes.Filecopy` rule, in either direction.** Nothing to enumerate.
+- **The disposable never initiates.** Dataflow is caller-*pull*, never
+  disposable-*push*, so there is no path by which a disposable could deliver
+  data to a qube that did not ask for it.
+- A Filecopy return would have been *worse than tedious*: disposable names are
+  allocated at spawn, so no per-disposable rule can be written, and the rule
+  would have had to name `@dispvm:<template>` or `@anyvm` as its **source**.
+
+stdout carries newline-delimited JSON status objects, then one `payload` header,
+then exactly `size` raw bytes. The client switches modes at that header's
+newline and reads a declared length rather than to EOF — the same discipline the
+send handler uses on its stdin.
+
 ## Trust boundaries
 
 | Component | Sees | Can it read the file? |

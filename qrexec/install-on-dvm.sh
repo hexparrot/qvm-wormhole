@@ -26,8 +26,10 @@ case "$persist" in
     } ;;
 esac
 
-install -D -m 0755 -o root -g root "${here}/wormhole.Send" /usr/local/etc/qubes-rpc/wormhole.Send
-ls -l /usr/local/etc/qubes-rpc/wormhole.Send
+for svc in wormhole.Send wormhole.Recv; do
+  install -D -m 0755 -o root -g root "${here}/${svc}" "/usr/local/etc/qubes-rpc/${svc}"
+done
+ls -l /usr/local/etc/qubes-rpc/wormhole.Send /usr/local/etc/qubes-rpc/wormhole.Recv
 
 # Look where the SERVICE will look, as the user it runs as. Under sudo $HOME is
 # /root, which is never where the qrexec service finds anything.
@@ -54,4 +56,6 @@ fi
 echo
 echo "Installed. Shut this VM down so disposables inherit it, then from a granted qube:"
 echo "    qvm-wormhole ./somefile"
-echo "dom0 needs:  wormhole.Send  +file  <caller>  @dispvm:$(hostname)  allow"
+echo "dom0 needs, per caller and per direction:"
+echo "    wormhole.Send  +file  <caller>  @dispvm:$(hostname)  allow"
+echo "    wormhole.Recv  +file  <caller>  @dispvm:$(hostname)  allow"

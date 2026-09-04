@@ -1,7 +1,8 @@
 # qvm-wormhole
 
-Send a file out of any Qubes AppVM, over [magic-wormhole](https://github.com/magic-wormhole/magic-wormhole),
-without giving that qube network access or a wormhole binary.
+Move files in and out of any Qubes AppVM, over
+[magic-wormhole](https://github.com/magic-wormhole/magic-wormhole), without
+giving that qube network access or a wormhole binary.
 
 ```
 $ qvm-wormhole ~/Documents/report.pdf
@@ -16,6 +17,16 @@ Disposable disp8101 has the file.
 Transfer complete.
 ```
 
+And the reverse:
+
+```
+$ qvm-wormhole-recv
+Wormhole code from the sender:  7-crossover-clockwork      # or a zenity prompt
+Waiting for the sender via a @dispvm:wormhole_dvm disposable -- Ctrl-C to cancel.
+Disposable disp4311 is waiting for the sender.
+Received /home/user/QubesIncoming/wormhole/report.pdf (284119 bytes)
+```
+
 ## How it works
 
 ```
@@ -25,6 +36,19 @@ qvm-wormhole ./report.pdf ──► wormhole.Send +file ──►  wormhole.Send
   prints it immediately         allow                      writes the payload
   streams header + bytes                                   runs `wormhole send`
 ```
+
+Receiving is the same picture with the arrows reversed: the disposable runs
+`wormhole receive` and hands the bytes back up **the same qrexec call**, because
+a qrexec call is bidirectional.
+
+**There is no `qubes.Filecopy` anywhere in this design, in either direction.**
+That is not a convenience — it is the security property. The disposable never
+initiates a connection to anything; it only ever answers a call you made. So
+there is no list of recipient qubes to enumerate in dom0, and no rule that would
+let a disposable push data into a qube that did not ask for it. A Filecopy-based
+return would have been forced to name `@dispvm:<template>` or `@anyvm` as its
+*source*, since disposable names are allocated at spawn — exactly the
+backpropagation you would not want.
 
 The calling qube never touches the network. The disposable does the transfer and
 is destroyed when it finishes. The file is encrypted before it leaves the
@@ -108,12 +132,19 @@ qube never needs one.
 ### 3. dom0
 
 Copy `qrexec/30-wormhole.policy` to `/etc/qubes/policy.d/30-wormhole.policy` and
-add one line per qube allowed to send:
+add one line per qube, **per direction**:
 
 ```
 wormhole.Send  +file  <caller>  @dispvm:wormhole_dvm  allow
+wormhole.Recv  +file  <caller>  @dispvm:wormhole_dvm  allow
 wormhole.Send  *      @anyvm    @anyvm                deny
+wormhole.Recv  *      @anyvm    @anyvm                deny
 ```
+
+**The two directions are separate services on purpose.** `wormhole.Send` is an
+exfiltration primitive; `wormhole.Recv` is an injection primitive. A hardened
+qube can reasonably be allowed to pull files in while remaining unable to send
+any out — grant each direction deliberately rather than as a pair.
 
 > The TARGET **must** name the DVM template. A bare `@dispvm` rule *refuses* a
 > caller that names one — verified against live dom0, not just the parser.
@@ -159,6 +190,23 @@ No VM, no network. Covers the verb table, the injection corpus, header
 validation, path containment, and two drift guards: that the policy file admits
 exactly the handler's verbs, and that codes the client mints satisfy the
 validator the service enforces.
+
+## Receiving is untrusted input
+
+Sending risks data leaving. Receiving risks data arriving. The received file
+comes from whoever holds the code, so:
+
+- it lands in `~/QubesIncoming/wormhole/`, mode `0600`, in a `0700` directory;
+- it is **never** given an execute bit and is **never** opened for you;
+- an existing file is never clobbered — a second `a.txt` becomes `a.1.txt`;
+- the filename is reduced to a basename on **both** sides, because it
+  originated with the remote sender and neither end trusts it;
+- the payload is written under a temporary name and renamed into place only
+  after its digest verifies, so a truncated or corrupt transfer never appears
+  as the real file.
+
+Directories and text messages are refused with a clear error; this tool moves
+single files.
 
 ## Notes
 

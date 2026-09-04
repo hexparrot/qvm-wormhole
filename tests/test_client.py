@@ -56,12 +56,14 @@ def load(path, name):
     return mod
 
 
+sys.path.insert(0, str(ROOT / "share"))
+import qvmwh                                          # noqa: E402
 client = load(CLIENT, "qvm_wormhole_client")
 
 
 class WordlistCase(unittest.TestCase):
     def test_the_shipped_wordlist_is_the_real_one(self):
-        w = client.load_wordlist()
+        w = qvmwh.load_wordlist()
         self.assertEqual(len(w["even"]), 256)
         self.assertEqual(len(w["odd"]), 256)
         self.assertEqual(len(set(w["even"])), 256)
@@ -71,7 +73,7 @@ class WordlistCase(unittest.TestCase):
 
 class CodeCase(unittest.TestCase):
     def setUp(self):
-        self.words = client.load_wordlist()
+        self.words = qvmwh.load_wordlist()
         src = HANDLER.read_text()
         pattern = src.split("CODE_RE = re.compile(r\"", 1)[1].split("\")", 1)[0]
         self.handler_re = re.compile(pattern)
@@ -83,17 +85,17 @@ class CodeCase(unittest.TestCase):
         code' and the cause is two files apart.
         """
         for _ in range(500):
-            self.assertRegex(client.mint_code(self.words), self.handler_re)
+            self.assertRegex(qvmwh.mint_code(self.words), self.handler_re)
 
     def test_the_nameplate_is_five_digits(self):
         for _ in range(200):
-            n = client.mint_code(self.words).split("-")[0]
+            n = qvmwh.mint_code(self.words).split("-")[0]
             self.assertEqual(len(n), 5)
             self.assertTrue(10000 <= int(n) <= 99999)
 
     def test_words_come_from_the_right_lists(self):
         for _ in range(200):
-            _, even, odd = client.mint_code(self.words).split("-")
+            _, even, odd = qvmwh.mint_code(self.words).split("-")
             self.assertIn(even, [w.lower() for w in self.words["even"]])
             self.assertIn(odd, [w.lower() for w in self.words["odd"]])
 
@@ -103,18 +105,18 @@ class CodeCase(unittest.TestCase):
         self.assertTrue(any(w != w.lower() for w in allw),
                         "wordlist has no capitals; this guard is now vacuous")
         for _ in range(300):
-            code = client.mint_code(self.words)
+            code = qvmwh.mint_code(self.words)
             self.assertEqual(code, code.lower())
 
     def test_codes_do_not_repeat(self):
-        seen = {client.mint_code(self.words) for _ in range(500)}
+        seen = {qvmwh.mint_code(self.words) for _ in range(500)}
         self.assertGreater(len(seen), 495)
 
 
 class DvmNameCase(unittest.TestCase):
     def test_only_well_formed_targets_are_accepted(self):
         for good in ["wormhole_dvm", "@dispvm", "@dispvm:wormhole_dvm", "vm-1.2"]:
-            self.assertTrue(client.DVM_RE.match(good), good)
+            self.assertTrue(qvmwh.DVM_RE.match(good), good)
 
     def test_anything_merely_starting_with_dispvm_is_refused(self):
         """Regression: an unanchored alternation let these through, and dom0
@@ -122,7 +124,7 @@ class DvmNameCase(unittest.TestCase):
         for bad in ["@dispvm:wormhole_dvm ", "@dispvm; rm -rf /", "@dispvm:",
                     "dispvm garbage/../", "@dispvm:bad name", "", "-vm",
                     "@anyvm", "a/b"]:
-            self.assertIsNone(client.DVM_RE.match(bad), bad)
+            self.assertIsNone(qvmwh.DVM_RE.match(bad), bad)
 
 
 class ConfigCase(unittest.TestCase):
@@ -130,26 +132,26 @@ class ConfigCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.conf = pathlib.Path(self.tmp.name) / "conf"
-        self._orig = client.CONF
-        client.CONF = str(self.conf)
-        self.addCleanup(lambda: setattr(client, "CONF", self._orig))
+        self._orig = qvmwh.CONF
+        qvmwh.CONF = str(self.conf)
+        self.addCleanup(lambda: setattr(qvmwh, "CONF", self._orig))
         for k in list(os.environ):
             if k.startswith("QVM_WORMHOLE_"):
                 del os.environ[k]
 
     def test_precedence_is_defaults_then_conf_then_env(self):
-        self.assertEqual(client.load_conf()["dvm"], "wormhole_dvm")
+        self.assertEqual(qvmwh.load_conf()["dvm"], "wormhole_dvm")
         self.conf.write_text("dvm = from_conf\n# a comment\ntimeout = 99\n")
-        self.assertEqual(client.load_conf()["dvm"], "from_conf")
-        self.assertEqual(client.load_conf()["timeout"], "99")
+        self.assertEqual(qvmwh.load_conf()["dvm"], "from_conf")
+        self.assertEqual(qvmwh.load_conf()["timeout"], "99")
         os.environ["QVM_WORMHOLE_DVM"] = "from_env"
         self.addCleanup(os.environ.pop, "QVM_WORMHOLE_DVM", None)
-        self.assertEqual(client.load_conf()["dvm"], "from_env")
-        self.assertEqual(client.load_conf()["timeout"], "99")
+        self.assertEqual(qvmwh.load_conf()["dvm"], "from_env")
+        self.assertEqual(qvmwh.load_conf()["timeout"], "99")
 
     def test_unknown_conf_keys_are_ignored(self):
         self.conf.write_text("nonsense = 1\ndvm = ok_dvm\n")
-        c = client.load_conf()
+        c = qvmwh.load_conf()
         self.assertEqual(c["dvm"], "ok_dvm")
         self.assertNotIn("nonsense", c)
 
@@ -159,7 +161,7 @@ class ConfigCase(unittest.TestCase):
         self.conf.write_text("timeout = 1h\n")
         with self.assertRaises(SystemExit) as cm, \
                 contextlib.redirect_stderr(io.StringIO()):
-            client.conf_int(client.load_conf(), "timeout")
+            qvmwh.conf_int(qvmwh.load_conf(), "timeout")
         self.assertEqual(cm.exception.code, 2)
 
 
@@ -323,7 +325,7 @@ class ShrinkingFileCase(unittest.TestCase):
             wh.write_text(WORMHOLE_SHIM)
             wh.chmod(0o755)
 
-            orig_hash = client.sha256_of
+            orig_hash = qvmwh.sha256_of
 
             def hash_then_shrink(path):
                 digest = orig_hash(path)
@@ -334,18 +336,18 @@ class ShrinkingFileCase(unittest.TestCase):
                    "WORMHOLE_SEND_BIN": str(wh)}
             old_env = {k: os.environ.get(k) for k in env}
             os.environ.update(env)
-            old = (sys.argv, client.sha256_of, client.CLIENT, client.STATE)
+            old = (sys.argv, qvmwh.sha256_of, qvmwh.QREXEC, qvmwh.STATE)
             sys.argv = ["qvm-wormhole", str(src), "--timeout", "60"]
-            client.sha256_of = hash_then_shrink
-            client.CLIENT = str(shim)
-            client.STATE = d / "state"
+            qvmwh.sha256_of = hash_then_shrink
+            qvmwh.QREXEC = str(shim)
+            qvmwh.STATE = d / "state"
             buf, errbuf = io.StringIO(), io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf), \
                      contextlib.redirect_stderr(errbuf):
                     rc = client.main()
             finally:
-                sys.argv, client.sha256_of, client.CLIENT, client.STATE = old
+                sys.argv, qvmwh.sha256_of, qvmwh.QREXEC, qvmwh.STATE = old
                 for k, v in old_env.items():
                     if v is None:
                         os.environ.pop(k, None)
@@ -356,7 +358,7 @@ class ShrinkingFileCase(unittest.TestCase):
             self.assertIn("changed while sending", errbuf.getvalue())
             self.assertNotIn("no receiver", errbuf.getvalue().lower())
             rec = json.loads(
-                (client.STATE if False else d / "state" / "journal.jsonl")
+                (qvmwh.STATE if False else d / "state" / "journal.jsonl")
                 .read_text().splitlines()[-1])
             self.assertLess(rec["sent"], rec["size"])
 

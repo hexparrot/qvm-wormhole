@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""qvm-wormhole-recv - pull one file into this qube via a disposable VM.
+
+The calling qube needs no network and no wormhole binary. A disposable receives
+the file over magic-wormhole and hands it back up the same qrexec call, so
+nothing needs qubes.Filecopy and the disposable never initiates anything.
+
+    qvm-wormhole-recv                  # prompts for the code
+    qvm-wormhole-recv 7-crossover-clockwork
+
+The received file is UNTRUSTED input from whoever holds the code. It lands in
+~/QubesIncoming/wormhole/ as mode 0600, is never given an execute bit, and is
+never opened for you.
+
+The capability is granted in dom0, not by installing this script. Without a
+policy line naming this qube, every call is refused with rc 126.
+"""
+
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import threading
+import time
+
+for _p in (os.environ.get("QVM_WORMHOLE_LIB"), "/usr/share/qvm-wormhole",
+           str(pathlib.Path(__file__).resolve().parent.parent / "share")):
+    if _p and os.path.isfile(os.path.join(_p, "qvmwh.py")):
+        sys.path.insert(0, _p)
+        break
+import qvmwh  # noqa: E402
+
+PROG = "qvm-wormhole-recv"
+SERVICE = "wormhole.Recv"
+VERB = "file"
+DEST = "~/QubesIncoming/wormhole"
+
+
+def ask_for_code():
+    """Prompt in the CALLING qube, so the window belongs to the qube the user
+    is actually looking at."""
+    if os.environ.get("DISPLAY"):
+        try:
+            p = subprocess.run(
+                ["zenity", "--entry", "--title=qvm-wormhole",
+                 "--text=Wormhole code from the sender:"],
+                capture_output=True, timeout=600)
+            if p.returncode == 0:
+                return p.stdout.decode().strip()
+            return ""            # cancelled
+        except (OSError, subprocess.TimeoutExpired):
+            pass                 # fall through to the terminal
+    if sys.stdin.isatty():
+        try:
+            return input("Wormhole code from the sender: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+    qvmwh.fail("no code given, and no way to ask for one (no DISPLAY, no tty). "
+               "Pass it as an argument.", PROG)
+
+
+def unique_path(directory, name):
+    """Never clobber. An incoming file must not be able to replace one that is
+    already here just by reusing its name."""
+    candidate = directory / name
+    if not candidate.exists():
+        return candidate
+    stem, dot, ext = name.partition(".")
+    for n in range(1, 1000):
+        alt = directory / ("%s.%d%s%s" % (stem, n, dot, ext))
+        if not alt.exists():
+            return alt
+    qvmwh.fail("too many files named like %r in %s" % (name, directory), PROG)
+
+
+def main():
+    conf = qvmwh.load_conf()
+    ap = argparse.ArgumentParser(
+        prog=PROG,
+        description="Receive one file into this qube via a disposable VM.")
+    ap.add_argument("code", nargs="?", help="the sender's wormhole code; "
+                                            "prompted for if omitted")
+    ap.add_argument("--dvm", default=conf["dvm"],
+                    help="DispVM template to spawn (default: %(default)s)")
+    ap.add_argument("--timeout", type=int, default=qvmwh.conf_int(conf, "timeout"),
+                    help="seconds to wait for the sender (default: %(default)s)")
+    ap.add_argument("--size-cap", type=int,
+                    default=qvmwh.conf_int(conf, "size_cap"),
+                    help="refuse a file larger than this many bytes")
+    ap.add_argument("--output-dir", default=DEST,
+                    help="where to write it (default: %(default)s)")
+    args = ap.parse_args()
+
+    if not qvmwh.DVM_RE.match(args.dvm):
+        qvmwh.fail("refusing dvm name %r" % args.dvm, PROG)
+    if not 1 <= args.timeout <= qvmwh.MAX_TIMEOUT:
+        qvmwh.fail("--timeout must be between 1 and %d seconds"
+                   % qvmwh.MAX_TIMEOUT, PROG)
+    if args.size_cap < 1:
+        qvmwh.fail("--size-cap must be positive", PROG)
+
+    code = (args.code or ask_for_code() or "").strip().lower()
+    if not code:
+        qvmwh.fail("no code given", PROG)
+    if not qvmwh.CODE_RE.match(code):
+        qvmwh.fail("that does not look like a wormhole code "
+                   "(expected something like 7-crossover-clockwork)", PROG)
+
+    dest_dir = pathlib.Path(args.output_dir).expanduser()
+    try:
+        dest_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as e:
+        qvmwh.fail("cannot create %s: %s" % (dest_dir, e), PROG)
+
+    target = qvmwh.target_for(args.dvm)
+    header = json.dumps({"code": code, "size_cap": args.size_cap,
+                         "timeout": args.timeout}, sort_keys=True)
+
+    print("Waiting for the sender via a %s disposable -- Ctrl-C to cancel."
+          % target, flush=True)
+
+    started = time.time()
+    proc = qvmwh.spawn(target, SERVICE, VERB, PROG)
+
+    # stderr is drained on a thread: this side does a long synchronous read of
+    # stdout, so a chatty stderr could otherwise fill its pipe and wedge both.
+    errbuf = []
+    et = threading.Thread(target=lambda: errbuf.append(proc.stderr.read() or b""),
+                          daemon=True)
+    et.start()
+    watchdog = threading.Timer(args.timeout + 60, proc.kill)
+    watchdog.start()
+
+    status = {"status": "no-reply"}
+    landed = None
+    rc = 1
+    try:
+        proc.stdin.write((header + "\n").encode())
+        proc.stdin.close()          # the header is the whole request
+
+        while True:
+            line = qvmwh.read_line(proc.stdout)
+            if line is None:
+                break
+            try:
+                msg = json.loads(line.decode(errors="replace"))
+            except ValueError:
+                continue
+            status.update(msg)
+            if msg.get("status") == "waiting":
+                print("Disposable %s is waiting for the sender."
+                      % msg.get("host", "?"), flush=True)
+            elif msg.get("status") == "error":
+                print("Failed: %s" % msg.get("message", "?"), file=sys.stderr)
+                break
+            elif msg.get("status") == "payload":
+                size = msg.get("size")
+                if not isinstance(size, int) or isinstance(size, bool) \
+                        or not 0 < size <= args.size_cap:
+                    qvmwh.fail("service declared an unusable size %r" % size, PROG)
+                # Re-sanitise: the name originated with the remote sender, so
+                # this end does not trust it either.
+                name = qvmwh.safe_name(msg.get("name", ""))
+                # Land it under a temp name and rename only once it verifies, so
+                # a partial or corrupt transfer never appears as the real file.
+                tmp = dest_dir / (".qvm-wormhole.partial-%d" % os.getpid())
+                import hashlib
+                h = hashlib.sha256()
+                got = 0
+                with open(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                                  0o600), "wb") as fh:
+                    while got < size:
+                        chunk = proc.stdout.read(min(qvmwh.CHUNK, size - got))
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        h.update(chunk)
+                        got += len(chunk)
+                if got != size:
+                    tmp.unlink(missing_ok=True)
+                    qvmwh.fail("truncated payload: %d of %d bytes" % (got, size),
+                               PROG)
+                if h.hexdigest() != msg.get("sha256"):
+                    tmp.unlink(missing_ok=True)
+                    qvmwh.fail("sha256 mismatch; the file was discarded", PROG)
+                landed = unique_path(dest_dir, name)
+                os.replace(str(tmp), str(landed))
+                os.chmod(str(landed), 0o600)
+                print("Received %s (%d bytes)" % (landed, size), flush=True)
+                rc = 0
+                break
+    except KeyboardInterrupt:
+        proc.kill()
+        print("\nCancelled. The disposable is destroyed.", file=sys.stderr)
+        rc = 130
+    finally:
+        watchdog.cancel()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            remote = proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            remote = proc.wait()
+        et.join(timeout=5)
+        err = errbuf[0] if errbuf else b""
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                pass
+        if rc not in (0, 130):
+            if b"Request refused" in err:
+                print(qvmwh.refusal_note(SERVICE, target, PROG), file=sys.stderr)
+                rc = 126
+            elif remote == 124 or status.get("status") == "error" \
+                    and "within" in str(status.get("message", "")):
+                rc = 124
+            elif err.strip():
+                sys.stderr.write(err.decode(errors="replace"))
+
+    qvmwh.journal({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "direction": "recv",
+        "path": str(landed) if landed else None,
+        "size": status.get("size"), "sha256": status.get("sha256"),
+        "nameplate": code.split("-", 1)[0], "dvm": args.dvm,
+        "disposable": status.get("host"), "status": status.get("status"),
+        "exit": rc, "duration_s": round(time.time() - started, 1),
+    }, PROG)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

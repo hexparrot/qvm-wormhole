@@ -16,6 +16,18 @@
 | mailbox reported "crowded" | nameplate collision on the public relay — someone else holds the same one | rare with a 5-digit nameplate. Re-run; a fresh code is minted each time |
 | transfer hangs with no output | DispVM cold start | first call is slowest; budget for it in `--timeout` |
 
+## Receiving
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `that does not look like a wormhole code` | typo, or the sender used `--code-length 1` | codes are `<digits>-<word>-<word>`; retype it |
+| `the sender sent a text message, not a file` | the far end ran `wormhole send --text` | this tool moves files; ask for a file |
+| `the sender sent a directory` | the far end sent a folder, which wormhole transfers as a directory offer | ask for a single file, or a tarball |
+| `sha256 mismatch; the file was discarded` | corruption in transit, or a service that lied | nothing was written; retry |
+| `truncated payload: N of M bytes` | the disposable died mid-handback | nothing was written; retry |
+| `no way to ask for one (no DISPLAY, no tty)` | run non-interactively with no code | pass the code as an argument |
+| received file has an unexpected name | the sender's filename was unusable, so it became `received.bin` | expected; the name is never trusted |
+
 ## Cancelling
 
 Ctrl-C. Killing the client drops the vchan, and dom0 destroys the disposable.
