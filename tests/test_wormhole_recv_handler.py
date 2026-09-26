@@ -100,7 +100,8 @@ class RecvHandlerCase(unittest.TestCase):
     def test_the_code_is_passed_to_wormhole_and_nothing_else_runs(self):
         self.run_handler("file", header())
         self.assertEqual(len(self.commands()), 1)
-        self.assertIn("receive --accept-file --output-file", self.commands()[0])
+        self.assertIn("receive --accept-file", self.commands()[0])
+        self.assertNotIn("--output-file", self.commands()[0])
         self.assertIn("51234-exceed-souvenir", self.commands()[0])
 
     def test_everything_else_is_refused_and_runs_nothing(self):
@@ -168,6 +169,16 @@ class RecvHandlerCase(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         msgs, _ = self.parse(p.stdout)
         self.assertIn("cap", msgs[-1]["message"])
+
+    def test_the_cap_is_enforced_while_wormhole_writes(self):
+        """RLIMIT_FSIZE, not an after-the-fact stat: a sender holding the
+        code must not be able to fill the disposable's private volume."""
+        p = self.run_handler("file", header(size_cap=3),
+                             WH_RECV_CONTENT="x" * 65536)
+        self.assertNotEqual(p.returncode, 0)
+        msgs, _ = self.parse(p.stdout)
+        self.assertIn("cap", msgs[-1]["message"])
+        self.assertFalse((self.home / "qvm-wormhole-out").exists())
 
     def test_non_integer_header_fields_are_refused(self):
         for field, value in [("size_cap", 1.5), ("size_cap", True),

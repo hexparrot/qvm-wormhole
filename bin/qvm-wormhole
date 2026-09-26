@@ -22,6 +22,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 
 for _p in (os.environ.get("QVM_WORMHOLE_LIB"), "/usr/share/qvm-wormhole",
@@ -85,7 +86,17 @@ def main():
     print("    wormhole receive %s" % code)
     print(flush=True)
 
-    digest = qvmwh.sha256_of(real)
+    # Size and digest come from the SAME pass, so the header always describes
+    # the bytes that were hashed. The stat() above was only a cheap pre-check.
+    try:
+        size, digest = qvmwh.measure(real)
+    except OSError as e:
+        qvmwh.fail("could not read %s: %s" % (real, e), PROG)
+    if size == 0:
+        qvmwh.fail("refusing to send an empty file", PROG)
+    if size > args.size_cap:
+        qvmwh.fail("%s is %d bytes, over the %d cap (--size-cap)"
+                   % (real, size, args.size_cap), PROG)
     header = json.dumps({
         "filename": real.name,
         "size": size,
@@ -103,14 +114,32 @@ def main():
     proc = qvmwh.spawn(target, SERVICE, VERB, PROG)
 
     def show(msg):
+        host = qvmwh.printable(msg.get("host", "?"))
         if msg.get("status") == "received":
-            print("Disposable %s has the file." % msg.get("host", "?"), flush=True)
+            print("Disposable %s has the file." % host, flush=True)
         elif msg.get("status") == "complete":
             print("Transfer complete.", flush=True)
         elif msg.get("status") == "error":
-            print("Failed: %s" % msg.get("message", "?"), file=sys.stderr)
+            print("Failed: %s" % qvmwh.printable(msg.get("message", "?")),
+                  file=sys.stderr)
 
     reader = qvmwh.drain_status(proc, status, show)
+    # stderr is drained concurrently too: a peer that talks before it listens
+    # would otherwise fill its pipe and block, with the write loop below
+    # blocked on it in turn.
+    et, errbuf = qvmwh.drain_stderr(proc)
+
+    # The watchdog covers EVERY phase, including the streaming one. A
+    # proc.wait(timeout) only helps once the write loop has finished, and a
+    # peer that stops reading stdin keeps that loop blocked indefinitely.
+    timed_out = threading.Event()
+
+    def shoot():
+        timed_out.set()
+        proc.kill()
+    watchdog = threading.Timer(args.timeout + qvmwh.GRACE, shoot)
+    watchdog.daemon = True
+    watchdog.start()
 
     sent = 0
     cancelled = False
@@ -129,6 +158,8 @@ def main():
                 sent += len(chunk)
     except KeyboardInterrupt:
         cancelled = True
+        proc.kill()                    # BEFORE closing stdin: close() flushes,
+                                       # and a flush into a wedged peer blocks
     except BrokenPipeError:
         broken_pipe = True             # far end died; its status says why
     except Exception as e:             # EIO, a vanished sshfs mount, anything
@@ -144,38 +175,40 @@ def main():
 
     rc = 1
     if cancelled:
-        proc.kill()
         proc.wait()
-        print("\nCancelled.", file=sys.stderr)
+        print("\nCancelled. The disposable is destroyed.", file=sys.stderr)
         rc = 130
     else:
         try:
-            rc = proc.wait(timeout=args.timeout + 60)
+            rc = proc.wait(timeout=args.timeout + qvmwh.GRACE)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            shoot()
             proc.wait()
-            print("\nGave up after %ds; the disposable is destroyed."
-                  % args.timeout, file=sys.stderr)
-            rc = 124
         except KeyboardInterrupt:
             proc.kill()
             proc.wait()
             cancelled = True
             print("\nCancelled. The disposable is destroyed.", file=sys.stderr)
             rc = 130
+    watchdog.cancel()
+    if timed_out.is_set() and not cancelled:
+        print("\nGave up after %ds; the disposable is destroyed."
+              % (args.timeout + qvmwh.GRACE), file=sys.stderr)
+        rc = 124
 
     reader.join(timeout=5)
-    err = b""
-    try:
-        err = proc.stderr.read() or b""   # safe: the process is dead by now
-    except OSError:
-        pass
-    finally:
-        for pipe in (proc.stdout, proc.stderr):
-            try:
-                pipe.close()
-            except OSError:
-                pass
+    et.join(timeout=5)
+    err = errbuf[0] if errbuf else b""
+    # Closing a buffered pipe while a thread is blocked reading it waits for
+    # that read: if something downstream of the dead peer still holds the
+    # write end, that is a hang. Leave such a pipe to process exit.
+    for pipe, owner in ((proc.stdout, reader), (proc.stderr, et)):
+        if owner.is_alive():
+            continue
+        try:
+            pipe.close()
+        except OSError:
+            pass
 
     if stream_err is not None:
         print("%s: could not read %s: %s" % (PROG, real, stream_err),
@@ -192,11 +225,16 @@ def main():
               "offered to a receiver." % (PROG, real, sent, size), file=sys.stderr)
         rc = 1
     elif broken_pipe and rc == 0:
+        # Not reachable with the shipped handler, which exits 0 only after
+        # consuming exactly `size` bytes. Kept as a guard against a future
+        # handler that does not.
         print("%s: the disposable closed the connection early" % PROG,
               file=sys.stderr)
         rc = 1
-    elif err.strip() and rc not in (0, 130):
-        sys.stderr.write(err.decode(errors="replace"))
+    elif err.strip() and rc not in (0, 124, 130):
+        sys.stderr.write(qvmwh.printable(err, keep_newlines=True))
+        if not err.endswith(b"\n"):
+            sys.stderr.write("\n")
 
     qvmwh.journal({
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

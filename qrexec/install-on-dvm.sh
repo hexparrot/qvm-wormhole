@@ -24,6 +24,14 @@ case "$persist" in
       echo "(an AppVM), or set FORCE=1 if you know better." >&2
       exit 1
     } ;;
+  rw-only)
+    ;;   # an AppVM or DVM template: the intended place
+  *)
+    [ "${FORCE:-}" = 1 ] || {
+      echo "error: cannot read /qubes-vm-persistence (got '$persist'); this" >&2
+      echo "does not look like a Qubes VM. Set FORCE=1 if you know better." >&2
+      exit 1
+    } ;;
 esac
 
 for svc in wormhole.Send wormhole.Recv; do

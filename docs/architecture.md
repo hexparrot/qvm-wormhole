@@ -56,6 +56,21 @@ watching in real time, but that is a convenience, not the record.
 Only the **nameplate** is journalled, never the full code. A single-use secret
 written to a logfile outlives its use.
 
+Failures are journalled too. A receive that ended in a digest mismatch or a
+truncated handback is the event the audit exists to keep, so no failure path in
+either client exits before the journal line is written.
+
+## What the far end may show you
+
+qrexec-client-vm filters terminal escapes out of both streams by default. The
+receive client has to switch that off for **stdout**, because the payload is
+binary; it stays on for stderr in both directions, and the send client leaves
+both filters on. Independently of that, every string a client prints that
+originated in the disposable -- a status message, an error line, its hostname,
+its stderr -- passes through `qvmwh.printable` first. JSON decoding would
+otherwise faithfully restore any control character a service or the remote
+sender managed to place in a message.
+
 ## Receiving: why the file comes back on stdout
 
 A qrexec call is bidirectional, so `wormhole.Recv` streams the received file

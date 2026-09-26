@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -41,6 +42,31 @@ exit 126
 DEAF_QREXEC = """#!/bin/sh
 # Accepts the call and exits without reading stdin. The client must not hang.
 exit 3
+"""
+
+STUCK_QREXEC = """#!/bin/sh
+# Accepts the call, never reads stdin, never exits. Only a watchdog that
+# covers the STREAMING phase gets the client out of this.
+exec sleep 300
+"""
+
+CHATTY_QREXEC = """#!/usr/bin/env python3
+# Talks before it listens: 256 KiB on stderr, well past the pipe buffer, then
+# drains stdin. A client that reads stderr only after exit deadlocks here.
+import sys
+sys.stderr.write("E" * (256 * 1024)); sys.stderr.flush()
+while sys.stdin.buffer.read(65536):
+    pass
+sys.exit(3)
+"""
+
+ESCAPING_QREXEC = """#!/usr/bin/env python3
+import sys, json
+sys.stdin.buffer.read()
+print(json.dumps({"status": "error", "host": "\\x1b]0;x\\x07d",
+                  "message": "\\x1b[2Jwiped"}), flush=True)
+sys.stderr.write("\\x1b[?1049hraw\\n")
+sys.exit(1)
 """
 
 WORMHOLE_SHIM = """#!/bin/sh
@@ -169,6 +195,9 @@ class InputCase(unittest.TestCase):
     def run_client(self, *args, **env_over):
         env = dict(os.environ)
         env["QVM_WORMHOLE_WORDLIST"] = str(ROOT / "share" / "wordlist.txt")
+        # Pin the library under test: an installed /usr/share copy would
+        # otherwise shadow the repo's.
+        env["QVM_WORMHOLE_LIB"] = str(ROOT / "share")
         env.update(env_over)
         return subprocess.run([sys.executable, str(CLIENT), *args],
                               capture_output=True, env=env, timeout=60)
@@ -250,6 +279,7 @@ class IntegrationCase(unittest.TestCase):
         env.update({
             "HOME": str(self.home),
             "QVM_WORMHOLE_WORDLIST": str(ROOT / "share" / "wordlist.txt"),
+            "QVM_WORMHOLE_LIB": str(ROOT / "share"),
             "QVM_WORMHOLE_QREXEC": str(shim),
             "FAKE_HANDLER": str(HANDLER),
             "WORMHOLE_SEND_BIN": str(self.wh),
@@ -287,6 +317,17 @@ class IntegrationCase(unittest.TestCase):
         self.assertIn("no policy line", p.stderr.decode())
         self.assertEqual(self.journal()["exit"], 126)
 
+    def test_a_peer_that_floods_stderr_before_reading_does_not_wedge(self):
+        """stderr is drained concurrently; a chatty peer must not block the
+        write loop, and the run must end well inside the timeout."""
+        p = self.run_client(CHATTY_QREXEC)
+        self.assertEqual(p.returncode, 3, p.stderr.decode()[-200:])
+
+    def test_terminal_escapes_from_the_far_end_are_neutralised(self):
+        p = self.run_client(ESCAPING_QREXEC)
+        self.assertNotIn(b"\x1b", p.stdout + p.stderr)
+        self.assertIn(b"wiped", p.stderr)
+
     def test_a_far_end_that_never_reads_does_not_hang(self):
         """The deadlock guard: stdin must always be closed and the process
         reaped, even when the peer vanishes mid-write."""
@@ -310,6 +351,46 @@ class IntegrationCase(unittest.TestCase):
         self.assertNotIn(code, jf.read_text())
 
 
+class StreamingWatchdogCase(unittest.TestCase):
+    """A peer that accepts the call and then never reads stdin used to block
+    the write loop forever: proc.wait(timeout) is only reached after the
+    loop, so --timeout covered nothing until then."""
+
+    def test_a_peer_stuck_mid_stream_is_shot_with_exit_124(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            src = d / "payload.bin"
+            src.write_bytes(b"C" * (4 * 1024 * 1024))   # > any pipe buffer
+            shim = d / "qrexec"
+            shim.write_text(STUCK_QREXEC)
+            shim.chmod(0o755)
+            env = {"HOME": str(d)}
+            old_env = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            old = (sys.argv, qvmwh.QREXEC, qvmwh.STATE, qvmwh.GRACE)
+            sys.argv = ["qvm-wormhole", str(src), "--timeout", "1"]
+            qvmwh.QREXEC, qvmwh.STATE, qvmwh.GRACE = str(shim), d / "state", 1
+            buf, errbuf = io.StringIO(), io.StringIO()
+            started = time.monotonic()
+            try:
+                with contextlib.redirect_stdout(buf), \
+                     contextlib.redirect_stderr(errbuf):
+                    rc = client.main()
+            finally:
+                sys.argv, qvmwh.QREXEC, qvmwh.STATE, qvmwh.GRACE = old
+                for k, v in old_env.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            self.assertEqual(rc, 124, errbuf.getvalue())
+            self.assertLess(time.monotonic() - started, 20)
+            self.assertIn("Gave up", errbuf.getvalue())
+            rec = json.loads((d / "state" / "journal.jsonl")
+                             .read_text().splitlines()[-1])
+            self.assertEqual(rec["exit"], 124)
+
+
 class ShrinkingFileCase(unittest.TestCase):
     """H2 regression, driven in-process so the shrink is deterministic."""
 
@@ -325,20 +406,20 @@ class ShrinkingFileCase(unittest.TestCase):
             wh.write_text(WORMHOLE_SHIM)
             wh.chmod(0o755)
 
-            orig_hash = qvmwh.sha256_of
+            orig_measure = qvmwh.measure
 
-            def hash_then_shrink(path):
-                digest = orig_hash(path)
+            def measure_then_shrink(path):
+                size, digest = orig_measure(path)
                 os.truncate(path, 4096)     # after stat and hash, before send
-                return digest
+                return size, digest
 
             env = {"HOME": str(d), "FAKE_HANDLER": str(HANDLER),
                    "WORMHOLE_SEND_BIN": str(wh)}
             old_env = {k: os.environ.get(k) for k in env}
             os.environ.update(env)
-            old = (sys.argv, qvmwh.sha256_of, qvmwh.QREXEC, qvmwh.STATE)
+            old = (sys.argv, qvmwh.measure, qvmwh.QREXEC, qvmwh.STATE)
             sys.argv = ["qvm-wormhole", str(src), "--timeout", "60"]
-            qvmwh.sha256_of = hash_then_shrink
+            qvmwh.measure = measure_then_shrink
             qvmwh.QREXEC = str(shim)
             qvmwh.STATE = d / "state"
             buf, errbuf = io.StringIO(), io.StringIO()
@@ -347,7 +428,7 @@ class ShrinkingFileCase(unittest.TestCase):
                      contextlib.redirect_stderr(errbuf):
                     rc = client.main()
             finally:
-                sys.argv, qvmwh.sha256_of, qvmwh.QREXEC, qvmwh.STATE = old
+                sys.argv, qvmwh.measure, qvmwh.QREXEC, qvmwh.STATE = old
                 for k, v in old_env.items():
                     if v is None:
                         os.environ.pop(k, None)

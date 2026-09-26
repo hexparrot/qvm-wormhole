@@ -28,7 +28,9 @@ import json
 import os
 import pathlib
 import re
+import resource
 import shutil
+import signal
 import subprocess
 import sys
 import syslog
@@ -141,20 +143,35 @@ def main():
             pass
 
         host = os.uname().nodename
-        say(status="waiting", host=host)
         wormhole = find_wormhole()
-        argv = [wormhole, "receive", "--accept-file", "--output-file", str(WORK),
-                code]
+        say(status="waiting", host=host)
+        # wormhole writes basename(<sender's name>) into its cwd and refuses
+        # to overwrite, and WORK is empty, so no --output-file is needed;
+        # what appeared there is inspected below.
+        argv = [wormhole, "receive", "--accept-file", code]
+
+        def limit_file_size():
+            # The cap is enforced by the KERNEL while wormhole writes, not
+            # checked afterwards: a sender who holds the code must not be
+            # able to fill this disposable's private volume. Any write past
+            # `cap` bytes kills wormhole with SIGXFSZ.
+            resource.setrlimit(resource.RLIMIT_FSIZE, (cap, cap))
+
         try:
             proc = subprocess.run(argv, stdin=subprocess.DEVNULL,
                                   capture_output=True, timeout=timeout,
-                                  cwd=str(WORK))
+                                  cwd=str(WORK), preexec_fn=limit_file_size)
         except subprocess.TimeoutExpired:
             die("no sender appeared within %ds" % timeout, rc=124)
         except OSError as e:
             die("could not run %s: %s" % (wormhole, e), rc=1)
 
         if proc.returncode != 0:
+            over = proc.returncode == -signal.SIGXFSZ or any(
+                e.is_file() and e.stat().st_size >= cap for e in WORK.iterdir())
+            if over:
+                die("the sender's file exceeds the %d byte cap; the transfer "
+                    "was cut off" % cap, rc=1)
             tail = (proc.stderr or b"").decode(errors="replace").strip()
             die(tail.splitlines()[-1] if tail
                 else "wormhole exited %d" % proc.returncode, rc=1)

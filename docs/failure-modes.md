@@ -25,6 +25,8 @@
 | `the sender sent a directory` | the far end sent a folder, which wormhole transfers as a directory offer | ask for a single file, or a tarball |
 | `sha256 mismatch; the file was discarded` | corruption in transit, or a service that lied | nothing was written; retry |
 | `truncated payload: N of M bytes` | the disposable died mid-handback | nothing was written; retry |
+| `the sender's file exceeds the N byte cap; the transfer was cut off` | the far end offered more than `--size-cap` (or than fits in the disposable) | the disposable's wormhole was stopped by a file-size limit before the disk filled; raise the cap and the DVM template's private volume, or ask for a smaller file |
+| `Gave up after Ns; the disposable is destroyed`, exit 124 | the disposable stopped answering entirely, in either direction | the client's own watchdog, `--timeout` plus a minute, fired; the service's own timeout normally reports first |
 | `no way to ask for one (no DISPLAY, no tty)` | run non-interactively with no code | pass the code as an argument |
 | received file has an unexpected name | the sender's filename was unusable, so it became `received.bin` | expected; the name is never trusted |
 

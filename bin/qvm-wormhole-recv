@@ -17,9 +17,11 @@ policy line naming this qube, every call is refused with rc 126.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
+import secrets
 import subprocess
 import sys
 import threading
@@ -36,6 +38,16 @@ PROG = "qvm-wormhole-recv"
 SERVICE = "wormhole.Recv"
 VERB = "file"
 DEST = "~/QubesIncoming/wormhole"
+
+
+class Bail(Exception):
+    """A failure after the call was placed. Raised instead of exiting so that
+    the disposable is killed, the temp file is removed and the journal is
+    written -- a failed receive is exactly what the audit trail is for."""
+
+    def __init__(self, message, rc=2):
+        super().__init__(message)
+        self.rc = rc
 
 
 def ask_for_code():
@@ -61,18 +73,69 @@ def ask_for_code():
                "Pass it as an argument.", PROG)
 
 
-def unique_path(directory, name):
-    """Never clobber. An incoming file must not be able to replace one that is
-    already here just by reusing its name."""
-    candidate = directory / name
-    if not candidate.exists():
-        return candidate
+def land(tmp, directory, name):
+    """Move the verified temp file to its final name without ever clobbering.
+
+    link(2) fails with EEXIST if the name is taken, so the claim is atomic: a
+    check-then-rename would let two concurrent receives of the same name
+    overwrite each other. An incoming file must not be able to replace one
+    that is already here just by reusing its name."""
     stem, dot, ext = name.partition(".")
-    for n in range(1, 1000):
-        alt = directory / ("%s.%d%s%s" % (stem, n, dot, ext))
-        if not alt.exists():
-            return alt
-    qvmwh.fail("too many files named like %r in %s" % (name, directory), PROG)
+    candidates = [name] + ["%s.%d%s%s" % (stem, n, dot, ext)
+                           for n in range(1, 1000)]
+    for cand in candidates:
+        target = directory / cand
+        try:
+            os.link(str(tmp), str(target))
+        except FileExistsError:
+            continue
+        os.unlink(str(tmp))
+        return target
+    raise Bail("too many files named like %r in %s" % (name, directory))
+
+
+def receive_payload(proc, msg, dest_dir, size_cap):
+    """Stream exactly the declared bytes to a temp file, verify, then land.
+    Whatever happens, the temp file does not survive a failure."""
+    size = msg.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) \
+            or not 0 < size <= size_cap:
+        raise Bail("service declared an unusable size %r" % size)
+    # Re-sanitise: the name originated with the remote sender, so this end
+    # does not trust it either.
+    name = qvmwh.safe_name(msg.get("name", ""))
+    # Land it under a temp name and rename only once it verifies, so a partial
+    # or corrupt transfer never appears as the real file. O_EXCL|O_NOFOLLOW:
+    # never write through something that was already at that name.
+    tmp = dest_dir / (".qvm-wormhole.partial-%d-%s"
+                      % (os.getpid(), secrets.token_hex(4)))
+    h = hashlib.sha256()
+    got = 0
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW, 0o600)
+        with open(fd, "wb") as fh:
+            while got < size:
+                chunk = proc.stdout.read(min(qvmwh.CHUNK, size - got))
+                if not chunk:
+                    break
+                fh.write(chunk)
+                h.update(chunk)
+                got += len(chunk)
+        if got != size:
+            raise Bail("truncated payload: %d of %d bytes" % (got, size))
+        if h.hexdigest() != msg.get("sha256"):
+            raise Bail("sha256 mismatch; the file was discarded")
+        return land(tmp, dest_dir, name), size
+    except OSError as e:
+        raise Bail("could not write into %s: %s" % (dest_dir, e))
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def main():
@@ -122,75 +185,68 @@ def main():
           % target, flush=True)
 
     started = time.time()
-    proc = qvmwh.spawn(target, SERVICE, VERB, PROG)
+    # raw_stdout: the payload is binary, so qrexec's escape filter must be off
+    # for stdout. It stays ON for stderr, and everything printed from a status
+    # line goes through qvmwh.printable regardless.
+    proc = qvmwh.spawn(target, SERVICE, VERB, PROG, raw_stdout=True)
 
     # stderr is drained on a thread: this side does a long synchronous read of
     # stdout, so a chatty stderr could otherwise fill its pipe and wedge both.
-    errbuf = []
-    et = threading.Thread(target=lambda: errbuf.append(proc.stderr.read() or b""),
-                          daemon=True)
-    et.start()
-    watchdog = threading.Timer(args.timeout + 60, proc.kill)
+    et, errbuf = qvmwh.drain_stderr(proc)
+
+    # The service enforces --timeout itself; this is the backstop for a peer
+    # that never answers, and it covers every phase including the payload.
+    timed_out = threading.Event()
+
+    def shoot():
+        timed_out.set()
+        proc.kill()
+    watchdog = threading.Timer(args.timeout + qvmwh.GRACE, shoot)
+    watchdog.daemon = True
     watchdog.start()
 
     status = {"status": "no-reply"}
     landed = None
     rc = 1
+    failure = None
     try:
-        proc.stdin.write((header + "\n").encode())
-        proc.stdin.close()          # the header is the whole request
+        try:
+            proc.stdin.write((header + "\n").encode())
+            proc.stdin.close()      # the header is the whole request
+        except OSError:
+            pass                    # peer already gone; its stderr says why
 
         while True:
-            line = qvmwh.read_line(proc.stdout)
+            try:
+                line = qvmwh.read_line(proc.stdout)
+            except qvmwh.LineTooLong:
+                raise Bail("the service sent an over-long status line")
             if line is None:
                 break
             try:
                 msg = json.loads(line.decode(errors="replace"))
             except ValueError:
                 continue
+            if not isinstance(msg, dict):
+                continue
             status.update(msg)
             if msg.get("status") == "waiting":
                 print("Disposable %s is waiting for the sender."
-                      % msg.get("host", "?"), flush=True)
+                      % qvmwh.printable(msg.get("host", "?")), flush=True)
             elif msg.get("status") == "error":
-                print("Failed: %s" % msg.get("message", "?"), file=sys.stderr)
+                print("Failed: %s" % qvmwh.printable(msg.get("message", "?")),
+                      file=sys.stderr)
                 break
             elif msg.get("status") == "payload":
-                size = msg.get("size")
-                if not isinstance(size, int) or isinstance(size, bool) \
-                        or not 0 < size <= args.size_cap:
-                    qvmwh.fail("service declared an unusable size %r" % size, PROG)
-                # Re-sanitise: the name originated with the remote sender, so
-                # this end does not trust it either.
-                name = qvmwh.safe_name(msg.get("name", ""))
-                # Land it under a temp name and rename only once it verifies, so
-                # a partial or corrupt transfer never appears as the real file.
-                tmp = dest_dir / (".qvm-wormhole.partial-%d" % os.getpid())
-                import hashlib
-                h = hashlib.sha256()
-                got = 0
-                with open(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                                  0o600), "wb") as fh:
-                    while got < size:
-                        chunk = proc.stdout.read(min(qvmwh.CHUNK, size - got))
-                        if not chunk:
-                            break
-                        fh.write(chunk)
-                        h.update(chunk)
-                        got += len(chunk)
-                if got != size:
-                    tmp.unlink(missing_ok=True)
-                    qvmwh.fail("truncated payload: %d of %d bytes" % (got, size),
-                               PROG)
-                if h.hexdigest() != msg.get("sha256"):
-                    tmp.unlink(missing_ok=True)
-                    qvmwh.fail("sha256 mismatch; the file was discarded", PROG)
-                landed = unique_path(dest_dir, name)
-                os.replace(str(tmp), str(landed))
-                os.chmod(str(landed), 0o600)
+                landed, size = receive_payload(proc, msg, dest_dir,
+                                               args.size_cap)
                 print("Received %s (%d bytes)" % (landed, size), flush=True)
                 rc = 0
                 break
+    except Bail as e:
+        failure = e
+        rc = e.rc
+        proc.kill()                 # do not wait 30s on a peer mid-stream
     except KeyboardInterrupt:
         proc.kill()
         print("\nCancelled. The disposable is destroyed.", file=sys.stderr)
@@ -208,12 +264,23 @@ def main():
             remote = proc.wait()
         et.join(timeout=5)
         err = errbuf[0] if errbuf else b""
-        for pipe in (proc.stdout, proc.stderr):
+        # Closing a buffered pipe while a thread is blocked reading it waits
+        # for that read: if something downstream of the dead peer still holds
+        # the write end, that is a hang. Leave such a pipe to process exit.
+        for pipe, owner in ((proc.stdout, None), (proc.stderr, et)):
+            if owner is not None and owner.is_alive():
+                continue
             try:
                 pipe.close()
             except OSError:
                 pass
-        if rc not in (0, 130):
+        if timed_out.is_set() and rc != 130:
+            print("\nGave up after %ds; the disposable is destroyed."
+                  % (args.timeout + qvmwh.GRACE), file=sys.stderr)
+            rc = 124
+        elif failure is not None:
+            print("%s: %s" % (PROG, failure), file=sys.stderr)
+        if rc not in (0, 124, 130):
             if b"Request refused" in err:
                 print(qvmwh.refusal_note(SERVICE, target, PROG), file=sys.stderr)
                 rc = 126
@@ -221,7 +288,9 @@ def main():
                     and "within" in str(status.get("message", "")):
                 rc = 124
             elif err.strip():
-                sys.stderr.write(err.decode(errors="replace"))
+                sys.stderr.write(qvmwh.printable(err, keep_newlines=True))
+                if not err.endswith(b"\n"):
+                    sys.stderr.write("\n")
 
     qvmwh.journal({
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -230,6 +299,7 @@ def main():
         "size": status.get("size"), "sha256": status.get("sha256"),
         "nameplate": code.split("-", 1)[0], "dvm": args.dvm,
         "disposable": status.get("host"), "status": status.get("status"),
+        "error": str(failure) if failure is not None else None,
         "exit": rc, "duration_s": round(time.time() - started, 1),
     }, PROG)
     return rc

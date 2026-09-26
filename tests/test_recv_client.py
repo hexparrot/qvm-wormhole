@@ -15,6 +15,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -56,6 +57,33 @@ sys.stdout.buffer.flush()
 """ % (body, name,
        len(body) if declared is None else declared,
        sha if sha is not None else hashlib.sha256(body).hexdigest())
+
+
+SLOW_EVIL_SERVICE = """#!/usr/bin/env python3
+# Declares an absurd size, then stalls. The client must refuse AND return
+# promptly, not sit out a 30s wait on a peer it has already given up on.
+import sys, json, time
+sys.stdin.buffer.readline()
+print(json.dumps({"status": "payload", "host": "d", "name": "x",
+                  "size": 10**9, "sha256": "0" * 64}), flush=True)
+time.sleep(120)
+"""
+
+LONG_LINE_SERVICE = """#!/usr/bin/env python3
+import sys
+sys.stdin.buffer.readline()
+sys.stdout.write("{" + "A" * 20000)
+sys.stdout.flush()
+"""
+
+ESCAPING_SERVICE = """#!/usr/bin/env python3
+import sys, json
+sys.stdin.buffer.readline()
+print(json.dumps({"status": "waiting", "host": "\\x1b]0;x\\x07disp0"}), flush=True)
+print(json.dumps({"status": "error", "message": "\\x1b[2Jwiped"}), flush=True)
+sys.stderr.write("\\x1b[?1049hraw\\n")
+sys.exit(1)
+"""
 
 
 class RecvClientCase(unittest.TestCase):
@@ -187,6 +215,65 @@ class RecvClientCase(unittest.TestCase):
                                     service=evil_service(declared=bad))
                 self.assertNotEqual(p.returncode, 0)
                 self.assertEqual(self.landed(), [])
+
+    def test_a_failed_receive_is_journalled(self):
+        """The audit exists for exactly this event. It used to be skipped
+        because the failure exited before reaching the journal call."""
+        p = self.run_client("51234-exceed-souvenir",
+                            service=evil_service(sha="0" * 64))
+        self.assertEqual(p.returncode, 2)
+        jf = self.home / ".local/state/qvm-wormhole/journal.jsonl"
+        rec = json.loads(jf.read_text().splitlines()[-1])
+        self.assertEqual(rec["exit"], 2)
+        self.assertIn("mismatch", rec["error"])
+        self.assertIsNone(rec["path"])
+
+    def test_an_early_refusal_returns_promptly(self):
+        started = time.monotonic()
+        p = self.run_client("51234-exceed-souvenir", "--size-cap", "100",
+                            service=SLOW_EVIL_SERVICE)
+        self.assertEqual(p.returncode, 2)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(self.landed(), [])
+
+    def test_an_overlong_status_line_is_a_clean_error(self):
+        started = time.monotonic()
+        p = self.run_client("51234-exceed-souvenir", service=LONG_LINE_SERVICE)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("over-long", p.stderr.decode())
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_terminal_escapes_from_the_far_end_are_neutralised(self):
+        p = self.run_client("51234-exceed-souvenir", service=ESCAPING_SERVICE)
+        self.assertNotIn(b"\x1b", p.stdout + p.stderr)
+        self.assertIn(b"wiped", p.stderr)
+        self.assertIn(b"disp0", p.stdout)
+
+    def test_no_partial_file_survives_any_failure(self):
+        for svc in [evil_service(declared=1000, body=b"short"),
+                    evil_service(sha="0" * 64), SLOW_EVIL_SERVICE]:
+            with self.subTest(svc=svc[-60:]):
+                self.run_client("51234-exceed-souvenir", "--size-cap", "100",
+                                service=svc)
+                self.assertEqual(self.landed(), [])
+
+    def test_landing_never_clobbers_even_when_raced(self):
+        """The claim on a name is link(2), which fails if it exists: a
+        check-then-rename would let a concurrent receive overwrite."""
+        import importlib.util, importlib.machinery
+        spec = importlib.util.spec_from_loader(
+            "recv_client", importlib.machinery.SourceFileLoader(
+                "recv_client", str(CLIENT)))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.dest.mkdir(parents=True)
+        (self.dest / "a.txt").write_bytes(b"first")
+        tmp = self.dest / ".partial"
+        tmp.write_bytes(b"second")
+        got = mod.land(tmp, self.dest, "a.txt")
+        self.assertEqual(got.name, "a.1.txt")
+        self.assertEqual((self.dest / "a.txt").read_bytes(), b"first")
+        self.assertFalse(tmp.exists())
 
     # --- policy ----------------------------------------------------------
 

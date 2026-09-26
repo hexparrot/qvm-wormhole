@@ -140,6 +140,9 @@ def main():
     timeout = max(60, min(strict_int(header.get("timeout", 3600), "timeout"), 86400))
 
     name = safe_name(header.get("filename", ""))
+    # Before reading a byte of payload: an unprovisioned disposable must not
+    # ingest gigabytes before discovering it has nothing to run them with.
+    wormhole = find_wormhole()
     try:
         WORK.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as e:
@@ -180,7 +183,6 @@ def main():
         host = os.uname().nodename
         say(status="received", host=host, bytes=size, name=name)
 
-        wormhole = find_wormhole()
         # argv LIST -- no shell, so `code` and `dest` are arguments, not syntax.
         argv = [wormhole, "send", "--code", code, "--no-qr", "--hide-progress",
                 str(dest)]

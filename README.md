@@ -167,7 +167,9 @@ space up front and refuses rather than filling the disk mid-transfer.
 
 `timeout` bounds the **whole** transfer — the wait for a receiver *and* the time
 the bytes take to move. An 8 GiB file over a slow link needs far more than the
-3600s default, or it is killed mid-flight.
+3600s default, or it is killed mid-flight. The client keeps its own watchdog at
+`timeout` plus a minute, covering every phase of the call including the bytes in
+flight, so a disposable that stops answering cannot pin the client indefinitely.
 
 ## Exit codes
 
@@ -201,9 +203,16 @@ comes from whoever holds the code, so:
 - an existing file is never clobbered — a second `a.txt` becomes `a.1.txt`;
 - the filename is reduced to a basename on **both** sides, because it
   originated with the remote sender and neither end trusts it;
-- the payload is written under a temporary name and renamed into place only
+- the payload is written under a temporary name and linked into place only
   after its digest verifies, so a truncated or corrupt transfer never appears
-  as the real file.
+  as the real file, and the temporary file is removed on every failure,
+  including Ctrl-C;
+- the size cap is enforced **while** the disposable receives, by a file-size
+  rlimit on the wormhole process, so a sender holding the code cannot fill the
+  disposable's private volume;
+- anything the disposable says that is shown to you -- status messages, error
+  text, its stderr -- is reduced to printable characters first. Nothing from
+  the far end can drive your terminal.
 
 Directories and text messages are refused with a clear error; this tool moves
 single files.
@@ -213,7 +222,9 @@ single files.
 - **Ctrl-C is the cancel path.** Killing the client drops the vchan and dom0
   destroys the disposable. Teardown is guaranteed, not best-effort.
 - **The audit lives on the caller**, in `~/.local/state/qvm-wormhole/journal.jsonl`
-  — a disposable's own journal dies with it. Only the nameplate is recorded,
-  never the full code.
+  — a disposable's own journal dies with it. Every attempted transfer is
+  recorded, failures included (a digest mismatch or a truncated handback is
+  precisely what the record is for). Only the nameplate is recorded, never the
+  full code.
 - **The disposable sees your file in plaintext.** It is ephemeral and holds only
   that one file, but if that matters, encrypt before sending.

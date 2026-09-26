@@ -202,6 +202,20 @@ class HandlerCase(unittest.TestCase):
                 left = [f.name for f in work.iterdir()] if work.exists() else []
                 self.assertEqual(left, [], "%s left %r behind" % (label, left))
 
+    def test_a_missing_wormhole_is_reported_before_the_payload_is_read(self):
+        """The header declares far more than stdin carries. If the handler
+        looked for the binary only after ingesting, it would die with
+        'stdin ended early' instead of the real cause."""
+        payload = b"x" * 10
+        h = json.loads(header(payload).decode())
+        h["size"] = 10 ** 9
+        p = self.run_handler("file", (json.dumps(h) + "\n").encode() + payload,
+                             WORMHOLE_SEND_BIN="/nonexistent/wormhole")
+        self.assertNotEqual(p.returncode, 0)
+        msgs = [json.loads(l) for l in p.stdout.decode().splitlines()]
+        self.assertIn("no wormhole binary", msgs[-1]["message"])
+        self.assertNotIn("stdin ended", msgs[-1]["message"])
+
     def test_non_integer_size_and_timeout_are_refused(self):
         """`size: 64.9` truncating to 64 would desync the byte count."""
         payload = b"w" * 64

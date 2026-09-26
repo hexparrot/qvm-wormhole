@@ -21,6 +21,10 @@ STATE = pathlib.Path(os.path.expanduser("~/.local/state/qvm-wormhole"))
 QREXEC = os.environ.get("QVM_WORMHOLE_QREXEC", "/usr/lib/qubes/qrexec-client-vm")
 CHUNK = 1024 * 1024
 MAX_TIMEOUT = 86400
+# Seconds past --timeout before a client shoots the vchan itself. The service
+# enforces --timeout on the far side; this is the backstop for a peer that
+# never answers at all, and it covers EVERY phase of the call.
+GRACE = 60
 
 # @dispvm, @dispvm:<template>, or a plain VM name -- fully anchored. An
 # unanchored alternation here would accept anything merely STARTING with
@@ -135,12 +139,18 @@ def mint_code(words):
                          secrets.choice(words["odd"]).lower())
 
 
-def sha256_of(path):
+def measure(path):
+    """(size, sha256) from a single read. Taking the size from a separate
+    stat() lets a file that grows between the two calls ship a digest over
+    more bytes than the declared size, which the far end then reports as a
+    digest mismatch rather than the truth: the file changed."""
     h = hashlib.sha256()
+    n = 0
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(CHUNK), b""):
             h.update(chunk)
-    return h.hexdigest()
+            n += len(chunk)
+    return n, h.hexdigest()
 
 
 def safe_name(raw, fallback="received.bin"):
@@ -162,10 +172,14 @@ def target_for(dvm):
     return dvm if dvm.startswith("@") else "@dispvm:" + dvm
 
 
-def spawn(target, service, verb, prog=None):
-    argv = [QREXEC, "--no-filter-escape-chars-stdout",
-            "--no-filter-escape-chars-stderr", "--",
-            target, "%s+%s" % (service, verb)]
+def spawn(target, service, verb, prog=None, raw_stdout=False):
+    """qrexec-client-vm filters terminal escapes out of both streams by
+    default. Only a caller expecting BINARY on stdout may switch that off,
+    and only for stdout: stderr is always shown to a human."""
+    argv = [QREXEC]
+    if raw_stdout:
+        argv.append("--no-filter-escape-chars-stdout")
+    argv += ["--", target, "%s+%s" % (service, verb)]
     try:
         return subprocess.Popen(argv, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -179,20 +193,48 @@ def refusal_note(service, target, prog=None):
             % (prog or PROG, service, target))
 
 
-def read_exact(stream, n):
-    """Read exactly n bytes or return short. Never depends on EOF."""
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = stream.read(min(CHUNK, n - len(buf)))
-        if not chunk:
-            break
-        buf += chunk
-    return bytes(buf)
+def printable(text, keep_newlines=False):
+    """Reduce text that came back up the call to something safe to print.
+
+    The disposable's stdout/stderr are relayed with qrexec's escape filter
+    off for the payload stream, and JSON decoding restores any control
+    characters a service or the remote sender managed to place in a message.
+    Nothing from the far end may drive the caller's terminal.
+    """
+    if isinstance(text, bytes):
+        text = text.decode(errors="replace")
+    out = []
+    for c in str(text):
+        if c == "\n" and keep_newlines:
+            out.append(c)
+        elif c == "\t" or (c.isprintable() and c != "\x7f"):
+            out.append(c)
+        else:
+            out.append("?")
+    return "".join(out)
+
+
+def drain_stderr(proc):
+    """Read stderr to EOF on a thread. Both clients block on the other pipe
+    for the length of a transfer; an undrained stderr larger than the pipe
+    buffer would wedge the peer, and therefore the client, with no timeout
+    covering it."""
+    buf = []
+    t = threading.Thread(target=lambda: buf.append(proc.stderr.read() or b""),
+                         daemon=True)
+    t.start()
+    return t, buf
+
+
+class LineTooLong(Exception):
+    """A status line exceeded the bound. Distinct from EOF: the caller must
+    treat it as a protocol violation rather than a clean close."""
 
 
 def read_line(stream, limit=8192):
     """Bounded readline over a binary stream. An unbounded one is a memory DoS
-    from a peer that never sends a newline."""
+    from a peer that never sends a newline. Returns None on EOF; raises
+    LineTooLong past the bound, so the two cannot be confused."""
     buf = bytearray()
     while len(buf) < limit:
         b = stream.read(1)
@@ -201,7 +243,7 @@ def read_line(stream, limit=8192):
         if b == b"\n":
             return bytes(buf)
         buf += b
-    return None
+    raise LineTooLong(limit)
 
 
 def journal(record, prog=None):
