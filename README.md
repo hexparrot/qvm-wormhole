@@ -85,7 +85,8 @@ Install magic-wormhole **inside `wormhole_dvm`**, into `~/.local` — its home i
 on the private volume, which every spawned disposable inherits:
 
 ```
-sha256sum -c SHA256SUMS && ./install.sh      # an offline pipx wheelhouse works
+sudo dnf install -y pipx
+pipx install magic-wormhole      # an offline wheelhouse works: --pip-args="--no-index --find-links=..."
 ```
 
 Then install the service handler, as root, in the same VM:
@@ -106,7 +107,7 @@ Shut `wormhole_dvm` down so disposables pick both up.
 | Package | Why | Symptom if missing |
 |---|---|---|
 | `qubes-core-agent-networking` | minimal templates ship **without networking** | no route in the disposable — and it looks *exactly* like the relay being firewalled |
-| `pipx` | the wheelhouse installer uses it | `install.sh` exits "pipx not found" |
+| `pipx` | magic-wormhole is installed with it (Fedora has no RPM since F36) | `pipx: command not found` |
 | `python3` | wheels are version-tagged | verify the minor version matches your wheel tags |
 
 The first row is the one that wastes an afternoon: a networkless disposable and a
@@ -119,9 +120,13 @@ blocked relay produce the same symptom, and only one of them is your fault.
 sudo sh install-template.sh
 ```
 
-Installs `/usr/bin/qvm-wormhole`, `/usr/share/qvm-wormhole/wordlist.txt` and
-`/etc/qvm-wormhole.conf`. **No wormhole binary is installed here** — the calling
-qube never needs one.
+Installs `/usr/bin/qvm-wormhole`, `/usr/bin/qvm-wormhole-recv`,
+`/usr/share/qvm-wormhole/` and `/etc/qvm-wormhole.conf` (an existing conf is
+kept). **No wormhole binary is installed here** — the calling qube never needs
+one.
+
+**A StandaloneVM** has its own persistent `/usr`, so run the same command in the
+StandaloneVM itself; there is no template step for it.
 
 > **Why `/usr/bin` and not `/usr/local/bin`.** In an AppVM `/usr/local` is
 > bind-mounted from `/rw/usrlocal`, so a template's `/usr/local` is *masked* in
@@ -148,6 +153,35 @@ any out — grant each direction deliberately rather than as a pair.
 
 > The TARGET **must** name the DVM template. A bare `@dispvm` rule *refuses* a
 > caller that names one — verified against live dom0, not just the parser.
+
+## Uninstall
+
+The reverse of the three install steps, each on the same machine as before:
+
+```
+# 1. where install-template.sh ran (the TemplateVM, or the StandaloneVM)
+sudo sh uninstall-template.sh            # --purge also removes /etc/qvm-wormhole.conf
+
+# 2. in wormhole_dvm, then shut it down from dom0
+sudo sh qrexec/uninstall-on-dvm.sh
+pipx uninstall magic-wormhole            # optional, as the user
+qvm-shutdown wormhole_dvm                # dom0
+
+# 3. dom0
+sudo rm /etc/qubes/policy.d/30-wormhole.policy   # or delete just your qube's lines
+qvm-remove wormhole_dvm                          # optional
+```
+
+`uninstall-template.sh` refuses while an approval gate file
+(`/usr/local/etc/approval.d/50-oci.conf`, below) exists on that machine: remove
+the gate with the tool that installed it, or pass `--keep-gate` to leave it for
+a later reinstall. In a TemplateVM the gate files live in each AppVM's
+`/usr/local`, which the script cannot see. Per-user state is left alone:
+`~/.local/state/qvm-wormhole/` (the audit journal) and
+`~/QubesIncoming/wormhole/` (received files).
+
+Removing only the dom0 lines is enough to switch the capability off: without a
+policy line every call is refused with exit 126 and no disposable is created.
 
 ## Configuration
 
@@ -208,8 +242,8 @@ While the gate is on, `QVM_WORMHOLE_LIB`, `QVM_WORMHOLE_QREXEC` and
 `QVM_WORMHOLE_WORDLIST` are ignored.
 
 > The gate binds callers without arbitrary exec (agents via MCP) and well-behaved callers. Anything with a shell as
-> `user` can skip it, with or without `sudo`. Tampering with the installed gate is caught by the doctor, not
-> prevented. dom0 is the only containment.
+> `user` can skip it, with or without `sudo`. Tampering with the installed gate is caught by a later check
+> (`qvm-wormhole --contract`, run by whatever installed the approver), not prevented. dom0 is the only containment.
 
 **An older `qvm-wormhole` ignores the file and sends ungated.** Check which
 client is installed with `qvm-wormhole --contract`, which prints the contract

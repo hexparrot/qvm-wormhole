@@ -80,6 +80,9 @@ No wormhole binary is installed here; the sending qube never needs one.
 Then **in dom0**: `qvm-shutdown <template>`, and restart any AppVM that should
 get the command.
 
+A **StandaloneVM** has its own persistent `/usr`: run `sudo sh install-template.sh`
+in the StandaloneVM itself, and skip the template step.
+
 ## 5. Grant the capability — in **dom0**
 
 Nothing works yet, by design. Create `/etc/qubes/policy.d/30-wormhole.policy`
@@ -148,3 +151,11 @@ that isolates transport from service:
 ```
 tools/dvm-run --target '@dispvm:wormhole_dvm' --label probe -c 'hostname; wormhole --version'
 ```
+
+## Uninstall
+
+Each step reverses on the machine where it was installed: `sudo sh
+uninstall-template.sh` in the TemplateVM (or StandaloneVM), `sudo sh
+qrexec/uninstall-on-dvm.sh` in `wormhole_dvm` (then `qvm-shutdown wormhole_dvm`),
+and the policy lines in dom0. See "Uninstall" in the README for the options and
+what is deliberately left behind.
