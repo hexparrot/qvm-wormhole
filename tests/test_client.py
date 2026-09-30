@@ -86,6 +86,23 @@ sys.path.insert(0, str(ROOT / "share"))
 import qvmwh                                          # noqa: E402
 client = load(CLIENT, "qvm_wormhole_client")
 
+# A live approval gate on this machine would put these tests' sends to the real
+# approver. Subprocess runs cannot be steered away from it (the path is a
+# constant on purpose), so they skip; in-process runs point the constant at a
+# path that does not exist.
+LIVE_GATE = os.path.lexists(qvmwh.APPROVAL_CONF)
+LIVE_GATE_WHY = ("a live approval gate exists at %s; subprocess sends would "
+                 "reach its approver" % qvmwh.APPROVAL_CONF)
+NO_GATE = str(ROOT / "tests" / "no-such-approval.conf")
+
+
+class NoLiveGate:
+    def setUp(self):
+        self._gate = qvmwh.APPROVAL_CONF
+        qvmwh.APPROVAL_CONF = NO_GATE
+        self.addCleanup(lambda: setattr(qvmwh, "APPROVAL_CONF", self._gate))
+        super().setUp()
+
 
 class WordlistCase(unittest.TestCase):
     def test_the_shipped_wordlist_is_the_real_one(self):
@@ -191,6 +208,7 @@ class ConfigCase(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
 
 
+@unittest.skipIf(LIVE_GATE, LIVE_GATE_WHY)
 class InputCase(unittest.TestCase):
     def run_client(self, *args, **env_over):
         env = dict(os.environ)
@@ -254,6 +272,7 @@ class InputCase(unittest.TestCase):
         self.assertIn("cannot run", p.stderr.decode())
 
 
+@unittest.skipIf(LIVE_GATE, LIVE_GATE_WHY)
 class IntegrationCase(unittest.TestCase):
     """Client and handler, wired together through a fake qrexec."""
 
@@ -351,7 +370,7 @@ class IntegrationCase(unittest.TestCase):
         self.assertNotIn(code, jf.read_text())
 
 
-class StreamingWatchdogCase(unittest.TestCase):
+class StreamingWatchdogCase(NoLiveGate, unittest.TestCase):
     """A peer that accepts the call and then never reads stdin used to block
     the write loop forever: proc.wait(timeout) is only reached after the
     loop, so --timeout covered nothing until then."""
@@ -391,7 +410,7 @@ class StreamingWatchdogCase(unittest.TestCase):
             self.assertEqual(rec["exit"], 124)
 
 
-class ShrinkingFileCase(unittest.TestCase):
+class ShrinkingFileCase(NoLiveGate, unittest.TestCase):
     """H2 regression, driven in-process so the shrink is deterministic."""
 
     def test_a_file_that_shrinks_after_hashing_is_reported_honestly(self):

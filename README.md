@@ -171,6 +171,60 @@ the bytes take to move. An 8 GiB file over a slow link needs far more than the
 `timeout` plus a minute, covering every phase of the call including the bytes in
 flight, so a disposable that stops answering cannot pin the client indefinitely.
 
+## Optional approval gate
+
+If `/usr/local/etc/approval.d/50-oci.conf` exists, `qvm-wormhole` asks an
+approver before every send. If it does not exist, nothing changes: the file is
+sent with no prompt, exactly as described above.
+
+The path is fixed. No argument, config key or environment variable moves it or
+turns the gate off. The file holds `key = value` lines:
+
+```
+approver = /usr/local/libexec/<your-approver>   # required
+approver_timeout = 420                          # optional, 10..3600 seconds
+```
+
+The file, its directory and the approver must be root-owned and not group- or
+world-writable. The approver must be an executable regular file.
+
+When the gate is on, a send works like this:
+
+1. The file is opened once and copied into a private staging directory (`0700`
+   directory, `0400` copy), and hashed in the same pass.
+2. The approver is run with no shell and an environment of `PATH` only. It gets
+   one JSON request line on stdin: the file's name, path, size and SHA-256, the
+   target, an id, a canonical digest, how long it may take, and who asked. It
+   must answer with one JSON line echoing the id and the digest, with
+   `"decision": "approve"` or `"deny"`.
+3. Only after an approval is the staged copy re-hashed and the code minted, and
+   only those staged bytes are sent. The disposable independently refuses
+   bytes that do not match the approved hash.
+
+The gate is **fail-closed**. A present-but-broken gate refuses with exit 125:
+an unsafe owner or mode, a missing approver, a timeout, a malformed or
+mismatched reply, or a denial. It never falls back to sending unapproved.
+While the gate is on, `QVM_WORMHOLE_LIB`, `QVM_WORMHOLE_QREXEC` and
+`QVM_WORMHOLE_WORDLIST` are ignored.
+
+> The gate binds callers without arbitrary exec (agents via MCP) and well-behaved callers. Anything with a shell as
+> `user` can skip it, with or without `sudo`. Tampering with the installed gate is caught by the doctor, not
+> prevented. dom0 is the only containment.
+
+**An older `qvm-wormhole` ignores the file and sends ungated.** Check which
+client is installed with `qvm-wormhole --contract`, which prints the contract
+versions and the gate state (`gated`, `approver`, `approver_ok`, `error`) as
+one JSON line without running the approver.
+
+**Flags for programs** (these work with or without the gate):
+
+| Flag | What it does |
+|---|---|
+| `--json` | stdout carries only events, one per line: `staged`, `approval` (`approve`, `deny` or `none`), `code`, `status` and `done`. Human text goes to stderr. `code` never comes before an `approval` of `approve` or `none`. |
+| `--fd N` | Sends from an inherited descriptor instead of a path. |
+| `--requester LABEL` | Tells the approver who is asking. It is shown as unverified. |
+| `--approver-wait N` | Shortens the approval wait. It never lengthens it. |
+
 ## Exit codes
 
 | Code | Meaning |
@@ -179,6 +233,7 @@ flight, so a disposable that stops answering cannot pin the client indefinitely.
 | 1 | the transfer failed |
 | 2 | bad input — missing file, empty, over a cap, malformed `--dvm` or `--timeout`. Also surfaces a header rejected by the service |
 | 124 | the transfer did not finish in time — nobody collected it, *or* the bytes were still moving |
+| 125 | not approved — the approval gate is on and the approver denied, failed or broke its contract; or the gate itself is broken. Nothing was sent |
 | 126 | dom0 refused — this qube has no policy line |
 | 130 | cancelled with Ctrl-C |
 

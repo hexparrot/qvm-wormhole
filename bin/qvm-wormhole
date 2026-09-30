@@ -14,19 +14,34 @@ vchan destroys the disposable, so teardown is guaranteed.
 The capability is granted in dom0, not by installing this script. Without a
 policy line naming this qube, every call is refused with rc 126 and no
 disposable is ever created.
+
+Optional approval gate: if /usr/local/etc/approval.d/50-oci.conf exists, every
+send is first staged (a private copy, hashed), then put to the approver it
+names, and only the approved bytes are sent. A present-but-broken gate refuses
+with rc 125; it never falls back to sending unapproved.
 """
 
 import argparse
 import json
 import os
 import pathlib
+import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
 
-for _p in (os.environ.get("QVM_WORMHOLE_LIB"), "/usr/share/qvm-wormhole",
-           str(pathlib.Path(__file__).resolve().parent.parent / "share")):
+# Same literal as qvmwh.APPROVAL_CONF (a test keeps them equal). It is checked
+# here, before the library is imported, because while the gate is on the
+# library may not come from QVM_WORMHOLE_LIB.
+_APPROVAL_CONF = "/usr/local/etc/approval.d/50-oci.conf"
+_BESIDE = str(pathlib.Path(__file__).resolve().parent.parent / "share")
+if os.path.lexists(_APPROVAL_CONF):
+    _SEARCH = (_BESIDE, "/usr/share/qvm-wormhole")
+else:
+    _SEARCH = (os.environ.get("QVM_WORMHOLE_LIB"), "/usr/share/qvm-wormhole", _BESIDE)
+for _p in _SEARCH:
     if _p and os.path.isfile(os.path.join(_p, "qvmwh.py")):
         sys.path.insert(0, _p)
         break
@@ -37,12 +52,30 @@ SERVICE = "wormhole.Send"
 VERB = "file"
 
 
-def main():
-    conf = qvmwh.load_conf()
+class Out:
+    """Human text goes to stdout, or to stderr under --json, where stdout
+    carries only event lines."""
+
+    def __init__(self, json_mode):
+        self.json = json_mode
+        self.lock = threading.Lock()
+
+    def say(self, text="", err=False):
+        stream = sys.stderr if (err or self.json) else sys.stdout
+        print(text, file=stream, flush=True)
+
+    def event(self, **kw):
+        if self.json:
+            with self.lock:
+                print(json.dumps(kw, ensure_ascii=True), file=sys.stdout,
+                      flush=True)
+
+
+def parse_args(conf):
     ap = argparse.ArgumentParser(
         prog=PROG,
         description="Send one file out of this qube via a disposable VM.")
-    ap.add_argument("file", help="the file to send")
+    ap.add_argument("file", nargs="?", help="the file to send")
     ap.add_argument("--dvm", default=conf["dvm"],
                     help="DispVM template to spawn (default: %(default)s). Must "
                          "match the dom0 policy line.")
@@ -52,7 +85,37 @@ def main():
     ap.add_argument("--size-cap", type=int,
                     default=qvmwh.conf_int(conf, "size_cap"),
                     help="refuse files larger than this many bytes")
-    args = ap.parse_args()
+    ap.add_argument("--fd", type=int, default=None,
+                    help="send from this inherited file descriptor instead of "
+                         "a path")
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable events on stdout, one JSON object "
+                         "per line; human text goes to stderr")
+    ap.add_argument("--contract", action="store_true",
+                    help="print this client's contract and gate state as one "
+                         "JSON line, and exit")
+    ap.add_argument("--requester", default=qvmwh.REQUESTER_DEFAULT,
+                    help="who is asking, shown to the approver (unverified)")
+    ap.add_argument("--approver-wait", type=int, default=None,
+                    help="wait at most this many seconds for approval (can "
+                         "only shorten the gate's own limit)")
+    return ap.parse_args()
+
+
+def main():
+    conf = qvmwh.load_conf()
+    args = parse_args(conf)
+    gated, info, gate_error = qvmwh.gate_state()
+
+    if args.contract:
+        print(json.dumps({
+            "cli": qvmwh.CLI_CONTRACT, "approval_hook": qvmwh.APPROVAL_HOOK,
+            "gated": gated, "conf": qvmwh.APPROVAL_CONF,
+            "approver": info.get("approver"),
+            "approver_ok": bool(gated and gate_error is None),
+            "error": gate_error, "dvm": args.dvm, "size_cap": args.size_cap,
+        }, ensure_ascii=True), flush=True)
+        return 0
 
     if not qvmwh.DVM_RE.match(args.dvm):
         qvmwh.fail("refusing dvm name %r" % args.dvm, PROG)
@@ -61,7 +124,42 @@ def main():
                    % qvmwh.MAX_TIMEOUT, PROG)
     if args.size_cap < 1:
         qvmwh.fail("--size-cap must be positive", PROG)
+    if (args.file is None) == (args.fd is None):
+        qvmwh.fail("give exactly one of FILE or --fd N", PROG)
+    if args.fd is not None and args.fd < 0:
+        qvmwh.fail("--fd must be a descriptor number", PROG)
+    req = args.requester
+    if not req or len(req) > qvmwh.REQUESTER_MAX or not req.isprintable():
+        qvmwh.fail("--requester must be 1..%d printable characters"
+                   % qvmwh.REQUESTER_MAX, PROG)
+    if args.approver_wait is not None and args.approver_wait < 10:
+        qvmwh.fail("--approver-wait must be at least 10 seconds", PROG)
 
+    out = Out(args.json)
+    if gated and gate_error:
+        out.event(event="approval", decision="deny", reason=gate_error)
+        out.say("%s: not sent: the approval gate is on but broken: %s"
+                % (PROG, qvmwh.printable(gate_error)), err=True)
+        qvmwh.journal(journal_base(args, args.file or "fd %d" % args.fd, {
+            "exit": qvmwh.EXIT_NOT_APPROVED,
+            "approval": "error:" + gate_error[:200]}), PROG)
+        out.event(event="done", exit=qvmwh.EXIT_NOT_APPROVED)
+        return qvmwh.EXIT_NOT_APPROVED
+    if not gated and args.fd is None:
+        return legacy(args, out)
+    return staged(args, out, gated, info)
+
+
+def journal_base(args, path, extra):
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "v": 1, "direction": "send", "path": str(path), "dvm": args.dvm,
+           "requester": args.requester}
+    rec.update(extra)
+    return rec
+
+
+def legacy(args, out):
+    """The ungated path flow, exactly as before the gate existed."""
     src = pathlib.Path(args.file).expanduser()
     try:
         real = src.resolve(strict=True)
@@ -80,11 +178,8 @@ def main():
     # multi-gigabyte file off slow media would otherwise leave the user staring
     # at nothing while the receiver waits to be told what to type.
     code = qvmwh.mint_code(qvmwh.load_wordlist())
-    print("Wormhole code: %s" % code)
-    print()
-    print("On the receiving computer, run:")
-    print("    wormhole receive %s" % code)
-    print(flush=True)
+    out.event(event="approval", decision="none", reason="")
+    show_code(out, code)
 
     # Size and digest come from the SAME pass, so the header always describes
     # the bytes that were hashed. The stat() above was only a cheap pre-check.
@@ -97,8 +192,150 @@ def main():
     if size > args.size_cap:
         qvmwh.fail("%s is %d bytes, over the %d cap (--size-cap)"
                    % (real, size, args.size_cap), PROG)
+    fh = open(real, "rb")
+    try:
+        return transfer(args, out, real.name, str(real), size, digest, code,
+                        fh.read, {"approval": "none"}, gated=False)
+    finally:
+        fh.close()
+
+
+def show_code(out, code):
+    out.event(event="code", code=code, nameplate=code.split("-", 1)[0])
+    out.say("Wormhole code: %s" % code)
+    out.say()
+    out.say("On the receiving computer, run:")
+    out.say("    wormhole receive %s" % code)
+    out.say()
+
+
+def _sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
+def staged(args, out, gated, info):
+    """Gate on, or --fd: one descriptor, one private staged copy, and from
+    then on only that copy's descriptor is read (re-hash, stream)."""
+    signal.signal(signal.SIGTERM, _sigterm)
+    own_fd = False
+    if args.fd is not None:
+        src_fd = args.fd
+        try:
+            st = os.fstat(src_fd)
+        except OSError as e:
+            qvmwh.fail("--fd %d: %s" % (src_fd, e.strerror or e), PROG)
+        try:
+            display = os.readlink("/proc/self/fd/%d" % src_fd)
+        except OSError:
+            display = "fd %d" % src_fd
+    else:
+        try:
+            real = pathlib.Path(args.file).expanduser().resolve(strict=True)
+        except OSError as e:
+            qvmwh.fail(str(e), PROG)
+        try:
+            src_fd = os.open(str(real), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as e:
+            qvmwh.fail("could not open %s: %s" % (real, e.strerror or e), PROG)
+        own_fd = True
+        st = os.fstat(src_fd)
+        display = str(real)
+    name = os.path.basename(display) or "file"
+    try:
+        if not stat.S_ISREG(st.st_mode):
+            qvmwh.fail("not a regular file: %s" % display, PROG)
+        if st.st_size == 0:
+            qvmwh.fail("refusing to send an empty file", PROG)
+        if st.st_size > args.size_cap:
+            qvmwh.fail("%s is %d bytes, over the %d cap (--size-cap)"
+                       % (display, st.st_size, args.size_cap), PROG)
+    except SystemExit:
+        if own_fd:
+            os.close(src_fd)
+        raise
+
+    target = qvmwh.target_for(args.dvm)
+    started = time.time()
+    approval = "none"
+    stage_fd = stage_dir = None
+    size = digest = None
+
+    def refused(rc, why):
+        qvmwh.journal(journal_base(args, display, {
+            "size": size, "sha256": digest, "exit": rc, "approval": approval,
+            "duration_s": round(time.time() - started, 1)}), PROG)
+        out.event(event="done", exit=rc)
+        return rc
+
+    try:
+        try:
+            stage_fd, stage_dir, size, digest = qvmwh.stage(src_fd, args.size_cap)
+        except ValueError:
+            qvmwh.fail("%s grew over the %d cap (--size-cap)"
+                       % (display, args.size_cap), PROG)
+        except OSError as e:
+            qvmwh.fail("could not read %s: %s" % (display, e.strerror or e), PROG)
+        finally:
+            if own_fd:
+                os.close(src_fd)
+        if size == 0:
+            qvmwh.fail("refusing to send an empty file", PROG)
+        out.event(event="staged", size=size, sha256=digest)
+
+        if gated:
+            wait_s = info["approver_timeout"]
+            if args.approver_wait is not None:
+                wait_s = min(wait_s, args.approver_wait)
+            request = qvmwh.send_request(display, name, size, digest, target,
+                                         wait_s, args.requester)
+            out.say("Asking for approval to send %s (%d bytes, sha256 %s...); "
+                    "waiting up to %ds." % (name, size, digest[:16], wait_s))
+            decision, reason, _tail = qvmwh.run_approver(
+                info["approver"], request, wait_s)
+            if decision != "approve":
+                approval = "denied" if decision == "deny" else "error:" + reason
+                out.event(event="approval", decision="deny", reason=reason)
+                out.say("%s: not sent: not approved (%s)."
+                        % (PROG, qvmwh.printable(reason)), err=True)
+                return refused(qvmwh.EXIT_NOT_APPROVED, reason)
+            again = qvmwh.rehash(stage_fd)
+            if again != (size, digest):
+                approval = "error:content-changed"
+                why = "the staged copy changed after approval"
+                out.event(event="approval", decision="deny", reason=why)
+                out.say("%s: not sent: %s." % (PROG, why), err=True)
+                return refused(qvmwh.EXIT_NOT_APPROVED, why)
+            approval = "approved"
+            out.event(event="approval", decision="approve", reason=reason)
+            out.say("Approved.")
+        else:
+            out.event(event="approval", decision="none", reason="")
+
+        code = qvmwh.mint_code(qvmwh.load_wordlist(gated))
+        show_code(out, code)
+        pos = [0]
+
+        def read(n):
+            chunk = os.pread(stage_fd, n, pos[0])
+            pos[0] += len(chunk)
+            return chunk
+        return transfer(args, out, name, display, size, digest, code, read,
+                        {"approval": approval}, gated=gated)
+    except KeyboardInterrupt:
+        if gated and approval == "none":
+            approval = "error:cancelled"
+        out.say("\nCancelled. Nothing was sent.", err=True)
+        return refused(130, "cancelled")
+    finally:
+        if stage_fd is not None:
+            os.close(stage_fd)
+        qvmwh.unstage(stage_dir)
+
+
+def transfer(args, out, name, display, size, digest, code, read, extra,
+             gated=False):
     header = json.dumps({
-        "filename": real.name,
+        "filename": name,
         "size": size,
         "sha256": digest,
         "code": code,
@@ -106,22 +343,24 @@ def main():
     }, sort_keys=True)
 
     target = qvmwh.target_for(args.dvm)
-    print("Sending %s (%d bytes) via a %s disposable." % (real.name, size, target))
-    print("Waiting for the receiver -- Ctrl-C to cancel.", flush=True)
+    out.say("Sending %s (%d bytes) via a %s disposable." % (name, size, target))
+    out.say("Waiting for the receiver -- Ctrl-C to cancel.")
 
     started = time.time()
     status = {"status": "no-reply"}
-    proc = qvmwh.spawn(target, SERVICE, VERB, PROG)
+    proc = qvmwh.spawn(target, SERVICE, VERB, PROG, gated=gated)
 
     def show(msg):
         host = qvmwh.printable(msg.get("host", "?"))
+        if msg.get("status") in ("received", "sending", "complete", "error"):
+            out.event(event="status", status=msg.get("status"), host=host)
         if msg.get("status") == "received":
-            print("Disposable %s has the file." % host, flush=True)
+            out.say("Disposable %s has the file." % host)
         elif msg.get("status") == "complete":
-            print("Transfer complete.", flush=True)
+            out.say("Transfer complete.")
         elif msg.get("status") == "error":
-            print("Failed: %s" % qvmwh.printable(msg.get("message", "?")),
-                  file=sys.stderr)
+            out.say("Failed: %s" % qvmwh.printable(msg.get("message", "?")),
+                    err=True)
 
     reader = qvmwh.drain_status(proc, status, show)
     # stderr is drained concurrently too: a peer that talks before it listens
@@ -148,14 +387,13 @@ def main():
     broken_pipe = False       # the PEER went away early
     try:
         proc.stdin.write((header + "\n").encode())
-        with open(real, "rb") as fh:
-            while sent < size:
-                chunk = fh.read(min(qvmwh.CHUNK, size - sent))
-                if not chunk:
-                    short_read = True          # the file shrank under us
-                    break
-                proc.stdin.write(chunk)
-                sent += len(chunk)
+        while sent < size:
+            chunk = read(min(qvmwh.CHUNK, size - sent))
+            if not chunk:
+                short_read = True          # the file shrank under us
+                break
+            proc.stdin.write(chunk)
+            sent += len(chunk)
     except KeyboardInterrupt:
         cancelled = True
         proc.kill()                    # BEFORE closing stdin: close() flushes,
@@ -176,7 +414,7 @@ def main():
     rc = 1
     if cancelled:
         proc.wait()
-        print("\nCancelled. The disposable is destroyed.", file=sys.stderr)
+        out.say("\nCancelled. The disposable is destroyed.", err=True)
         rc = 130
     else:
         try:
@@ -188,12 +426,12 @@ def main():
             proc.kill()
             proc.wait()
             cancelled = True
-            print("\nCancelled. The disposable is destroyed.", file=sys.stderr)
+            out.say("\nCancelled. The disposable is destroyed.", err=True)
             rc = 130
     watchdog.cancel()
     if timed_out.is_set() and not cancelled:
-        print("\nGave up after %ds; the disposable is destroyed."
-              % (args.timeout + qvmwh.GRACE), file=sys.stderr)
+        out.say("\nGave up after %ds; the disposable is destroyed."
+                % (args.timeout + qvmwh.GRACE), err=True)
         rc = 124
 
     reader.join(timeout=5)
@@ -211,39 +449,39 @@ def main():
             pass
 
     if stream_err is not None:
-        print("%s: could not read %s: %s" % (PROG, real, stream_err),
-              file=sys.stderr)
+        out.say("%s: could not read %s: %s" % (PROG, display, stream_err),
+                err=True)
         rc = 1
     elif b"Request refused" in err:
         # Checked BEFORE the short-send case: when the peer dies early the byte
         # count is a symptom, not the cause, and blaming the file would send
         # someone hunting a disk problem that does not exist.
-        print(qvmwh.refusal_note(SERVICE, target, PROG), file=sys.stderr)
+        out.say(qvmwh.refusal_note(SERVICE, target, PROG), err=True)
         rc = 126
     elif short_read and not cancelled:
-        print("%s: %s changed while sending (%d of %d bytes); nothing was "
-              "offered to a receiver." % (PROG, real, sent, size), file=sys.stderr)
+        out.say("%s: %s changed while sending (%d of %d bytes); nothing was "
+                "offered to a receiver." % (PROG, display, sent, size), err=True)
         rc = 1
     elif broken_pipe and rc == 0:
         # Not reachable with the shipped handler, which exits 0 only after
         # consuming exactly `size` bytes. Kept as a guard against a future
         # handler that does not.
-        print("%s: the disposable closed the connection early" % PROG,
-              file=sys.stderr)
+        out.say("%s: the disposable closed the connection early" % PROG,
+                err=True)
         rc = 1
     elif err.strip() and rc not in (0, 124, 130):
         sys.stderr.write(qvmwh.printable(err, keep_newlines=True))
         if not err.endswith(b"\n"):
             sys.stderr.write("\n")
 
-    qvmwh.journal({
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "direction": "send",
-        "path": str(real), "size": size, "sent": sent, "sha256": digest,
-        "nameplate": code.split("-", 1)[0], "dvm": args.dvm,
+    rec = journal_base(args, display, {
+        "size": size, "sent": sent, "sha256": digest,
+        "nameplate": code.split("-", 1)[0],
         "disposable": status.get("host"), "status": status.get("status"),
-        "exit": rc, "duration_s": round(time.time() - started, 1),
-    }, PROG)
+        "exit": rc, "duration_s": round(time.time() - started, 1)})
+    rec.update(extra)
+    qvmwh.journal(rec, PROG)
+    out.event(event="done", exit=rc)
     return rc
 
 
