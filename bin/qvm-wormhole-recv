@@ -8,9 +8,19 @@ nothing needs qubes.Filecopy and the disposable never initiates anything.
     qvm-wormhole-recv                  # prompts for the code
     qvm-wormhole-recv 7-crossover-clockwork
 
-The received file is UNTRUSTED input from whoever holds the code. It lands in
-~/QubesIncoming/wormhole/ as mode 0600, is never given an execute bit, and is
-never opened for you.
+The received file is UNTRUSTED input from whoever holds the code. It always
+lands in ~/WormIncoming/ as mode 0600 (there is no option to put it
+anywhere else), is never given an execute bit, and is never opened for you.
+
+The disposable HOLDS the file: it receives and hashes it, reports the name,
+size and sha256, and sends nothing more until this client releases exactly
+that sha256. Ungated, the release follows at once.
+
+Optional approval gate: if /usr/local/etc/approval.d/50-oci.conf exists, the
+held offer is put to the approver it names (action wormhole.recv.offer), and
+the file is released only on approve. Denied, unanswered, or a gate that is
+present but broken: exit 125, and the file never enters this qube -- it is
+discarded with the disposable.
 
 The capability is granted in dom0, not by installing this script. Without a
 policy line naming this qube, every call is refused with rc 126.
@@ -22,13 +32,22 @@ import json
 import os
 import pathlib
 import secrets
+import signal
 import subprocess
 import sys
 import threading
 import time
 
-for _p in (os.environ.get("QVM_WORMHOLE_LIB"), "/usr/share/qvm-wormhole",
-           str(pathlib.Path(__file__).resolve().parent.parent / "share")):
+# Same literal as qvmwh.APPROVAL_CONF (a test keeps them equal). It is checked
+# here, before the library is imported, because while the gate is on the
+# library may not come from QVM_WORMHOLE_LIB.
+_APPROVAL_CONF = "/usr/local/etc/approval.d/50-oci.conf"
+_BESIDE = str(pathlib.Path(__file__).resolve().parent.parent / "share")
+if os.path.lexists(_APPROVAL_CONF):
+    _SEARCH = (_BESIDE, "/usr/share/qvm-wormhole")
+else:
+    _SEARCH = (os.environ.get("QVM_WORMHOLE_LIB"), "/usr/share/qvm-wormhole", _BESIDE)
+for _p in _SEARCH:
     if _p and os.path.isfile(os.path.join(_p, "qvmwh.py")):
         sys.path.insert(0, _p)
         break
@@ -37,7 +56,12 @@ import qvmwh  # noqa: E402
 PROG = "qvm-wormhole-recv"
 SERVICE = "wormhole.Recv"
 VERB = "file"
-DEST = "~/QubesIncoming/wormhole"
+# Fixed. Not an argument, a config key or an environment variable: the
+# approval and the fleet policy both name this one folder.
+DEST = "~/WormIncoming"
+REQUESTER_DEFAULT = "qvm-wormhole-recv command line"
+UNGATED_HOLD = 60          # seconds the disposable waits for an ungated release
+HOLD_MARGIN = 30           # past the approver's own worst case
 
 
 class Bail(Exception):
@@ -48,6 +72,27 @@ class Bail(Exception):
     def __init__(self, message, rc=2):
         super().__init__(message)
         self.rc = rc
+
+
+class Out:
+    """Human text goes to stdout, or to stderr under --json, where stdout
+    carries only event lines."""
+
+    def __init__(self, json_mode):
+        self.json = json_mode
+
+    def say(self, text="", err=False):
+        stream = sys.stderr if (err or self.json) else sys.stdout
+        print(text, file=stream, flush=True)
+
+    def event(self, **kw):
+        if self.json:
+            print(json.dumps(kw, ensure_ascii=True), file=sys.stdout,
+                  flush=True)
+
+
+def dest_dir():
+    return pathlib.Path(DEST).expanduser()
 
 
 def ask_for_code():
@@ -94,21 +139,28 @@ def land(tmp, directory, name):
     raise Bail("too many files named like %r in %s" % (name, directory))
 
 
-def receive_payload(proc, msg, dest_dir, size_cap):
-    """Stream exactly the declared bytes to a temp file, verify, then land.
-    Whatever happens, the temp file does not survive a failure."""
+def check_offer(msg, size_cap):
+    """(name, size, sha256) from a `held` or `payload` line, or Bail. The name
+    is re-sanitised: it originated with the remote sender."""
     size = msg.get("size")
     if not isinstance(size, int) or isinstance(size, bool) \
             or not 0 < size <= size_cap:
-        raise Bail("service declared an unusable size %r" % size)
-    # Re-sanitise: the name originated with the remote sender, so this end
-    # does not trust it either.
-    name = qvmwh.safe_name(msg.get("name", ""))
+        raise Bail("service declared an unusable size %r" % (size,))
+    digest = msg.get("sha256")
+    if not isinstance(digest, str) or len(digest) != 64 \
+            or any(c not in "0123456789abcdef" for c in digest):
+        raise Bail("service declared an unusable sha256")
+    return qvmwh.safe_name(msg.get("name", "")), size, digest
+
+
+def receive_payload(proc, name, size, digest, directory):
+    """Stream exactly the declared bytes to a temp file, verify, then land.
+    Whatever happens, the temp file does not survive a failure."""
     # Land it under a temp name and rename only once it verifies, so a partial
     # or corrupt transfer never appears as the real file. O_EXCL|O_NOFOLLOW:
     # never write through something that was already at that name.
-    tmp = dest_dir / (".qvm-wormhole.partial-%d-%s"
-                      % (os.getpid(), secrets.token_hex(4)))
+    tmp = directory / (".qvm-wormhole.partial-%d-%s"
+                       % (os.getpid(), secrets.token_hex(4)))
     h = hashlib.sha256()
     got = 0
     try:
@@ -124,11 +176,11 @@ def receive_payload(proc, msg, dest_dir, size_cap):
                 got += len(chunk)
         if got != size:
             raise Bail("truncated payload: %d of %d bytes" % (got, size))
-        if h.hexdigest() != msg.get("sha256"):
+        if h.hexdigest() != digest:
             raise Bail("sha256 mismatch; the file was discarded")
-        return land(tmp, dest_dir, name), size
+        return land(tmp, directory, name)
     except OSError as e:
-        raise Bail("could not write into %s: %s" % (dest_dir, e))
+        raise Bail("could not write into %s: %s" % (directory, e))
     finally:
         try:
             tmp.unlink()
@@ -138,11 +190,11 @@ def receive_payload(proc, msg, dest_dir, size_cap):
             pass
 
 
-def main():
-    conf = qvmwh.load_conf()
+def parse_args(conf):
     ap = argparse.ArgumentParser(
         prog=PROG,
-        description="Receive one file into this qube via a disposable VM.")
+        description="Receive one file into ~/WormIncoming via a "
+                    "disposable VM.")
     ap.add_argument("code", nargs="?", help="the sender's wormhole code; "
                                             "prompted for if omitted")
     ap.add_argument("--dvm", default=conf["dvm"],
@@ -152,9 +204,39 @@ def main():
     ap.add_argument("--size-cap", type=int,
                     default=qvmwh.conf_int(conf, "size_cap"),
                     help="refuse a file larger than this many bytes")
-    ap.add_argument("--output-dir", default=DEST,
-                    help="where to write it (default: %(default)s)")
-    args = ap.parse_args()
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable events on stdout, one JSON object "
+                         "per line; human text goes to stderr")
+    ap.add_argument("--contract", action="store_true",
+                    help="print this client's contract and gate state as one "
+                         "JSON line, and exit")
+    ap.add_argument("--requester", default=REQUESTER_DEFAULT,
+                    help="who is asking, shown to the approver (unverified)")
+    ap.add_argument("--approver-wait", type=int, default=None,
+                    help="wait at most this many seconds for approval (can "
+                         "only shorten the gate's own limit)")
+    return ap.parse_args()
+
+
+def _sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
+def main():
+    conf = qvmwh.load_conf()
+    args = parse_args(conf)
+    gated, info, gate_error = qvmwh.gate_state()
+
+    if args.contract:
+        print(json.dumps({
+            "cli": qvmwh.CLI_CONTRACT, "approval_hook": qvmwh.APPROVAL_HOOK,
+            "gated": gated, "conf": qvmwh.APPROVAL_CONF,
+            "approver": info.get("approver"),
+            "approver_ok": bool(gated and gate_error is None),
+            "error": gate_error, "dvm": args.dvm, "size_cap": args.size_cap,
+            "dest": str(dest_dir()), "hold": True,
+        }, ensure_ascii=True), flush=True)
+        return 0
 
     if not qvmwh.DVM_RE.match(args.dvm):
         qvmwh.fail("refusing dvm name %r" % args.dvm, PROG)
@@ -163,6 +245,12 @@ def main():
                    % qvmwh.MAX_TIMEOUT, PROG)
     if args.size_cap < 1:
         qvmwh.fail("--size-cap must be positive", PROG)
+    req = args.requester
+    if not req or len(req) > qvmwh.REQUESTER_MAX or not req.isprintable():
+        qvmwh.fail("--requester must be 1..%d printable characters"
+                   % qvmwh.REQUESTER_MAX, PROG)
+    if args.approver_wait is not None and args.approver_wait < 10:
+        qvmwh.fail("--approver-wait must be at least 10 seconds", PROG)
 
     code = (args.code or ask_for_code() or "").strip().lower()
     if not code:
@@ -171,48 +259,92 @@ def main():
         qvmwh.fail("that does not look like a wormhole code "
                    "(expected something like 7-crossover-clockwork)", PROG)
 
-    dest_dir = pathlib.Path(args.output_dir).expanduser()
-    try:
-        dest_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    except OSError as e:
-        qvmwh.fail("cannot create %s: %s" % (dest_dir, e), PROG)
+    out = Out(args.json)
+    started = time.time()
 
+    def record(extra):
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "v": 1, "direction": "recv", "path": None, "size": None,
+               "sha256": None, "nameplate": code.split("-", 1)[0],
+               "dvm": args.dvm, "disposable": None, "status": None,
+               "error": None, "requester": args.requester,
+               "approval": "none",
+               "duration_s": round(time.time() - started, 1)}
+        rec.update(extra)
+        qvmwh.journal(rec, PROG)
+
+    if gated and gate_error:
+        out.event(event="approval", decision="deny", reason=gate_error)
+        out.say("%s: not received: the approval gate is on but broken: %s"
+                % (PROG, qvmwh.printable(gate_error)), err=True)
+        record({"exit": qvmwh.EXIT_NOT_APPROVED,
+                "approval": "error:" + gate_error[:200]})
+        out.event(event="done", exit=qvmwh.EXIT_NOT_APPROVED)
+        return qvmwh.EXIT_NOT_APPROVED
+
+    directory = dest_dir()
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as e:
+        qvmwh.fail("cannot create %s: %s" % (directory, e), PROG)
+
+    wait_s = None
+    if gated:
+        wait_s = info["approver_timeout"]
+        if args.approver_wait is not None:
+            wait_s = min(wait_s, args.approver_wait)
+        hold = wait_s + qvmwh.APPROVER_EXTRA_WAIT + qvmwh.APPROVER_KILL_GRACE \
+            + HOLD_MARGIN
+    else:
+        hold = UNGATED_HOLD
+
+    signal.signal(signal.SIGTERM, _sigterm)
     target = qvmwh.target_for(args.dvm)
     header = json.dumps({"code": code, "size_cap": args.size_cap,
-                         "timeout": args.timeout}, sort_keys=True)
+                         "timeout": args.timeout, "hold": hold},
+                        sort_keys=True)
 
-    print("Waiting for the sender via a %s disposable -- Ctrl-C to cancel."
-          % target, flush=True)
+    out.say("Waiting for the sender via a %s disposable -- Ctrl-C to cancel."
+            % target)
 
-    started = time.time()
     # raw_stdout: the payload is binary, so qrexec's escape filter must be off
     # for stdout. It stays ON for stderr, and everything printed from a status
     # line goes through qvmwh.printable regardless.
-    proc = qvmwh.spawn(target, SERVICE, VERB, PROG, raw_stdout=True)
+    proc = qvmwh.spawn(target, SERVICE, VERB, PROG, raw_stdout=True,
+                       gated=gated)
 
     # stderr is drained on a thread: this side does a long synchronous read of
     # stdout, so a chatty stderr could otherwise fill its pipe and wedge both.
     et, errbuf = qvmwh.drain_stderr(proc)
 
     # The service enforces --timeout itself; this is the backstop for a peer
-    # that never answers, and it covers every phase including the payload.
+    # that never answers, and it covers every phase, the hold included.
     timed_out = threading.Event()
 
     def shoot():
         timed_out.set()
         proc.kill()
-    watchdog = threading.Timer(args.timeout + qvmwh.GRACE, shoot)
+    watchdog = threading.Timer(args.timeout + hold + qvmwh.GRACE, shoot)
     watchdog.daemon = True
     watchdog.start()
 
+    def close_stdin():
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
     status = {"status": "no-reply"}
+    offer = None
     landed = None
+    approval = "none"
     rc = 1
     failure = None
     try:
         try:
+            # stdin stays OPEN after the header: the release goes down it.
             proc.stdin.write((header + "\n").encode())
-            proc.stdin.close()      # the header is the whole request
+            proc.stdin.flush()
         except OSError:
             pass                    # peer already gone; its stderr says why
 
@@ -230,17 +362,68 @@ def main():
             if not isinstance(msg, dict):
                 continue
             status.update(msg)
-            if msg.get("status") == "waiting":
-                print("Disposable %s is waiting for the sender."
-                      % qvmwh.printable(msg.get("host", "?")), flush=True)
-            elif msg.get("status") == "error":
-                print("Failed: %s" % qvmwh.printable(msg.get("message", "?")),
-                      file=sys.stderr)
+            st = msg.get("status")
+            if st == "waiting":
+                host = qvmwh.printable(msg.get("host", "?"))
+                out.event(event="waiting", host=host)
+                out.say("Disposable %s is waiting for the sender." % host)
+            elif st == "error":
+                out.say("Failed: %s" % qvmwh.printable(msg.get("message", "?")),
+                        err=True)
                 break
-            elif msg.get("status") == "payload":
-                landed, size = receive_payload(proc, msg, dest_dir,
-                                               args.size_cap)
-                print("Received %s (%d bytes)" % (landed, size), flush=True)
+            elif st == "held":
+                if offer is not None:
+                    raise Bail("the service offered twice")
+                offer = check_offer(msg, args.size_cap)
+                name, size, digest = offer
+                out.event(event="offer", name=name, size=size, sha256=digest)
+                out.say("The disposable holds %s (%d bytes, sha256 %s...)."
+                        % (qvmwh.printable(name), size, digest[:16]))
+                if gated:
+                    request = qvmwh.recv_request(
+                        name, size, digest, str(directory), target, wait_s,
+                        args.requester)
+                    out.say("Asking for approval to let it in; waiting up to "
+                            "%ds." % wait_s)
+                    decision, reason, _tail = qvmwh.run_approver(
+                        info["approver"], request, wait_s)
+                    if decision != "approve":
+                        approval = ("denied" if decision == "deny"
+                                    else "error:" + reason)
+                        out.event(event="approval", decision="deny",
+                                  reason=reason)
+                        out.say("%s: not received: not approved (%s). The file "
+                                "never left the disposable."
+                                % (PROG, qvmwh.printable(reason)), err=True)
+                        close_stdin()   # the handler discards on EOF
+                        rc = qvmwh.EXIT_NOT_APPROVED
+                        break
+                    approval = "approved"
+                    out.event(event="approval", decision="approve",
+                              reason=reason)
+                    out.say("Approved.")
+                else:
+                    out.event(event="approval", decision="none", reason="")
+                try:
+                    proc.stdin.write((json.dumps({"release": digest}) + "\n")
+                                     .encode())
+                    proc.stdin.flush()
+                except OSError:
+                    pass            # peer gone; the read below finds out
+                close_stdin()
+            elif st == "payload":
+                # Never accept bytes that were not held first: that is what
+                # the approval looked at.
+                if offer is None:
+                    raise Bail("the service sent a payload it had not held "
+                               "(an older wormhole.Recv?); refused")
+                if check_offer(msg, args.size_cap) != offer:
+                    raise Bail("the payload is not the file that was offered")
+                name, size, digest = offer
+                landed = receive_payload(proc, name, size, digest, directory)
+                out.event(event="received", path=str(landed), size=size,
+                          sha256=digest)
+                out.say("Received %s (%d bytes)" % (landed, size))
                 rc = 0
                 break
     except Bail as e:
@@ -249,14 +432,13 @@ def main():
         proc.kill()                 # do not wait 30s on a peer mid-stream
     except KeyboardInterrupt:
         proc.kill()
-        print("\nCancelled. The disposable is destroyed.", file=sys.stderr)
+        if gated and approval == "none" and offer is not None:
+            approval = "error:cancelled"
+        out.say("\nCancelled. The disposable is destroyed.", err=True)
         rc = 130
     finally:
         watchdog.cancel()
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
+        close_stdin()
         try:
             remote = proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -275,14 +457,14 @@ def main():
             except OSError:
                 pass
         if timed_out.is_set() and rc != 130:
-            print("\nGave up after %ds; the disposable is destroyed."
-                  % (args.timeout + qvmwh.GRACE), file=sys.stderr)
+            out.say("\nGave up after %ds; the disposable is destroyed."
+                    % (args.timeout + hold + qvmwh.GRACE), err=True)
             rc = 124
         elif failure is not None:
-            print("%s: %s" % (PROG, failure), file=sys.stderr)
-        if rc not in (0, 124, 130):
+            out.say("%s: %s" % (PROG, failure), err=True)
+        if rc not in (0, 124, 125, 130):
             if b"Request refused" in err:
-                print(qvmwh.refusal_note(SERVICE, target, PROG), file=sys.stderr)
+                out.say(qvmwh.refusal_note(SERVICE, target, PROG), err=True)
                 rc = 126
             elif remote == 124 or status.get("status") == "error" \
                     and "within" in str(status.get("message", "")):
@@ -292,16 +474,16 @@ def main():
                 if not err.endswith(b"\n"):
                     sys.stderr.write("\n")
 
-    qvmwh.journal({
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "direction": "recv",
+    record({
         "path": str(landed) if landed else None,
-        "size": status.get("size"), "sha256": status.get("sha256"),
-        "nameplate": code.split("-", 1)[0], "dvm": args.dvm,
+        "offered": offer[0] if offer else None,
+        "size": offer[1] if offer else status.get("size"),
+        "sha256": offer[2] if offer else status.get("sha256"),
         "disposable": status.get("host"), "status": status.get("status"),
         "error": str(failure) if failure is not None else None,
-        "exit": rc, "duration_s": round(time.time() - started, 1),
-    }, PROG)
+        "approval": approval, "exit": rc,
+    })
+    out.event(event="done", exit=rc)
     return rc
 
 

@@ -15,7 +15,7 @@
 # /usr/local, which this script cannot see: check them yourself.
 #
 # Per-user state is left alone: ~/.local/state/qvm-wormhole (the audit journal)
-# and ~/QubesIncoming/wormhole (received files). DESTDIR prefixes every path;
+# and ~/WormIncoming (received files). DESTDIR prefixes every path;
 # it exists for the tests.
 set -eu
 purge=0

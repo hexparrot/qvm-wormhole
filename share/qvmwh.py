@@ -211,7 +211,10 @@ def safe_name(raw, fallback="received.bin"):
     name = os.path.basename(str(raw))
     if not name or name in (".", "..") or name.startswith("-"):
         return fallback
-    if "/" in name or "\0" in name or any(ord(c) < 32 for c in name):
+    # isprintable() also refuses DEL, bidi overrides and other format
+    # characters: the name is shown to a human who approves the file by it.
+    if "/" in name or "\0" in name or not name.isprintable() \
+            or "\x7f" in name:
         return fallback
     return name[:200]
 
@@ -436,6 +439,25 @@ def send_request(path, name, size, sha256, target, wait_s, requester):
         "digest": request_digest("wormhole.send", "content-out", subject,
                                  targets),
         "wait_s": wait_s, "requester": requester, "provider": "qvm-wormhole",
+    }
+
+
+def recv_request(name, size, sha256, into, target, wait_s, requester):
+    """approval-hook v1, action wormhole.recv.offer (shape inbound-offer).
+    Everything under subject.offer came from the SENDER and is unverified,
+    except that size and sha256 are what the disposable measured on the bytes
+    it holds -- the bytes this caller will later refuse unless they match."""
+    subject = {"offer": {"name": name, "size": size, "sha256": sha256},
+               "into": into}
+    targets = [target]
+    return {
+        "v": APPROVAL_HOOK, "type": "request", "id": secrets.token_hex(16),
+        "action": "wormhole.recv.offer", "shape": "inbound-offer",
+        "subject": subject, "targets": targets,
+        "digest": request_digest("wormhole.recv.offer", "inbound-offer",
+                                 subject, targets),
+        "wait_s": wait_s, "requester": requester,
+        "provider": "qvm-wormhole-recv",
     }
 
 

@@ -5,9 +5,18 @@ Runs inside a DispVM. Install into the DVM TEMPLATE's /usr/local/etc/qubes-rpc/,
 which rides its private volume and is inherited by every disposable.
 
     caller --> qrexec  wormhole.Recv+file --> this handler
-               stdin:  one JSON header line {code, size_cap, timeout}
+               stdin:  one JSON header line {code, size_cap, timeout[, hold]}
+                       and, with `hold`, later one release line
                stdout: JSON status lines, then one {"status":"payload",...}
                        line, then exactly `size` raw bytes
+
+HOLD (`hold: <seconds>` in the header): the file is received and hashed HERE,
+reported as {"status":"held", name, size, sha256}, and nothing more is sent
+until the caller writes one line {"release": "<that sha256>"}. Anything else --
+another digest, garbage, EOF, or no line within `hold` seconds -- discards the
+file and ends the call, which destroys the disposable. This is what lets the
+caller ask a human about the offer while the bytes are still out here: a
+refused file never enters the calling qube at all.
 
 **There is no qubes.Filecopy anywhere in this design.** A qrexec call is
 bidirectional, so the file goes back up the pipe the caller already opened. The
@@ -29,17 +38,21 @@ import os
 import pathlib
 import re
 import resource
+import select
 import shutil
 import signal
 import subprocess
 import sys
 import syslog
+import time
 
 VERBS = {"file"}
 MAX_HEADER = 8192
 SIZE_CAP = int(os.environ.get("WORMHOLE_RECV_SIZE_CAP", 2 * 1024**3))
 HEADROOM = 16 * 1024**2
 CODE_RE = re.compile(r"^[0-9]{1,6}(-[a-z]+){2,}$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+HOLD_RANGE = (10, 3900)          # seconds the caller may keep a held file waiting
 WORK = pathlib.Path(os.path.expanduser("~/qvm-wormhole-out"))
 
 WORMHOLE_PATHS = [
@@ -68,23 +81,60 @@ def strict_int(value, what):
     return value
 
 
-def read_header(stream):
+def read_line_fd(fd, limit, deadline=None):
+    """Bounded, UNBUFFERED readline on a raw descriptor. Unbuffered because a
+    second line (the release) follows the header much later, and a buffered
+    reader could swallow part of it. Returns (bytes, None), or (None, why):
+    "eof", "long" or "timeout"."""
     buf = bytearray()
-    while len(buf) < MAX_HEADER:
-        b = stream.read(1)
+    while len(buf) < limit:
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None, "timeout"
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                return None, "timeout"
+        b = os.read(fd, 1)
         if not b:
-            die("stdin closed before the header was complete")
+            return None, "eof"
         if b == b"\n":
-            return bytes(buf)
+            return bytes(buf), None
         buf += b
-    die("header exceeded %d bytes" % MAX_HEADER)
+    return None, "long"
+
+
+def read_header(fd):
+    line, why = read_line_fd(fd, MAX_HEADER)
+    if why == "eof":
+        die("stdin closed before the header was complete")
+    if why == "long":
+        die("header exceeded %d bytes" % MAX_HEADER)
+    return line
+
+
+def await_release(fd, digest, hold):
+    """Wait up to `hold` seconds for {"release": digest}. Anything else is a
+    refusal; the caller's file is discarded by main()'s finally."""
+    line, why = read_line_fd(fd, MAX_HEADER, time.monotonic() + hold)
+    if why == "timeout":
+        die("not released within %ds; the file was discarded" % hold, rc=1)
+    if why is not None:
+        die("not released (the caller withdrew); the file was discarded", rc=1)
+    try:
+        msg = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        die("unparseable release line; the file was discarded", rc=1)
+    if not isinstance(msg, dict) or msg.get("release") != digest:
+        die("the release does not name this file; it was discarded", rc=1)
 
 
 def safe_name(raw, fallback="received.bin"):
     name = os.path.basename(str(raw))
     if not name or name in (".", "..") or name.startswith("-"):
         return fallback
-    if "/" in name or "\0" in name or any(ord(c) < 32 for c in name):
+    if "/" in name or "\0" in name or not name.isprintable() \
+            or "\x7f" in name:
         return fallback
     return name[:200]
 
@@ -111,7 +161,7 @@ def main():
         sys.exit(2)
 
     try:
-        header = json.loads(read_header(sys.stdin.buffer).decode("utf-8"))
+        header = json.loads(read_header(0).decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as e:
         die("unparseable header: %s" % e)
     if not isinstance(header, dict):
@@ -124,6 +174,11 @@ def main():
     if cap < 1:
         die("size_cap must be positive")
     timeout = max(60, min(strict_int(header.get("timeout", 3600), "timeout"), 86400))
+    hold = header.get("hold")
+    if hold is not None:
+        hold = strict_int(hold, "hold")
+        if not HOLD_RANGE[0] <= hold <= HOLD_RANGE[1]:
+            die("hold must be %d..%d seconds" % HOLD_RANGE)
 
     # A clean, empty directory: afterwards we identify the payload by looking at
     # what actually appeared, never by trusting a name the sender chose.
@@ -204,8 +259,12 @@ def main():
                 h.update(chunk)
 
         name = safe_name(got.name)
-        say(status="payload", host=host, name=name, size=size,
-            sha256=h.hexdigest())
+        digest = h.hexdigest()
+        if hold is not None:
+            say(status="held", host=host, name=name, size=size, sha256=digest)
+            syslog.syslog(syslog.LOG_INFO, "holding %d bytes for %s" % (size, peer))
+            await_release(0, digest, hold)
+        say(status="payload", host=host, name=name, size=size, sha256=digest)
         out = sys.stdout.buffer
         with got.open("rb") as fh:
             while True:

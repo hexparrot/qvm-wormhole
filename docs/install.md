@@ -121,7 +121,7 @@ and feed its code to:
 qvm-wormhole-recv
 ```
 
-The file lands in `~/QubesIncoming/wormhole/`.
+The file lands in `~/WormIncoming/`.
 
 ## 7. Verify the blast radius — in an **ungranted** AppVM
 

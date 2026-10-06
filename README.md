@@ -24,8 +24,13 @@ $ qvm-wormhole-recv
 Wormhole code from the sender:  7-crossover-clockwork      # or a zenity prompt
 Waiting for the sender via a @dispvm:wormhole_dvm disposable -- Ctrl-C to cancel.
 Disposable disp4311 is waiting for the sender.
-Received /home/user/QubesIncoming/wormhole/report.pdf (284119 bytes)
+The disposable holds report.pdf (284119 bytes, sha256 9f2c0b7e41aa03d1...).
+Received /home/user/WormIncoming/report.pdf (284119 bytes)
 ```
+
+A received file always lands in `~/WormIncoming/`; there is no option to put it
+anywhere else. The disposable **holds** it first (see below), so with the
+optional approval gate a refused file never enters the qube at all.
 
 ## How it works
 
@@ -178,7 +183,7 @@ the gate with the tool that installed it, or pass `--keep-gate` to leave it for
 a later reinstall. In a TemplateVM the gate files live in each AppVM's
 `/usr/local`, which the script cannot see. Per-user state is left alone:
 `~/.local/state/qvm-wormhole/` (the audit journal) and
-`~/QubesIncoming/wormhole/` (received files).
+`~/WormIncoming/` (received files).
 
 Removing only the dom0 lines is enough to switch the capability off: without a
 policy line every call is refused with exit 126 and no disposable is created.
@@ -287,7 +292,15 @@ validator the service enforces.
 Sending risks data leaving. Receiving risks data arriving. The received file
 comes from whoever holds the code, so:
 
-- it lands in `~/QubesIncoming/wormhole/`, mode `0600`, in a `0700` directory;
+- the disposable receives and hashes it, reports its name, size and sha256,
+  and **holds** it until the client releases exactly that sha256. With the
+  approval gate on (`/usr/local/etc/approval.d/50-oci.conf`), the client puts
+  that offer to the approver (action `wormhole.recv.offer`, shape
+  `inbound-offer`) and releases it only on approve; denied, unanswered or a
+  broken gate is exit 125 and the file is destroyed with the disposable. A
+  payload the disposable did not hold first, or one that differs from the
+  offer, is refused;
+- it lands in `~/WormIncoming/` (fixed), mode `0600`, in a `0700` directory;
 - it is **never** given an execute bit and is **never** opened for you;
 - an existing file is never clobbered — a second `a.txt` becomes `a.1.txt`;
 - the filename is reduced to a basename on **both** sides, because it

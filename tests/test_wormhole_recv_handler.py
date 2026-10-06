@@ -205,5 +205,70 @@ class RecvHandlerCase(unittest.TestCase):
                 self.assertFalse((self.home / "qvm-wormhole-out").exists())
 
 
+    # --- the hold: nothing is handed back until the caller releases it -----
+
+    def release(self, digest):
+        return (json.dumps({"release": digest}) + "\n").encode()
+
+    def test_a_held_file_is_reported_then_handed_back_on_release(self):
+        sha = hashlib.sha256(b"PAYLOAD").hexdigest()
+        p = self.run_handler("file", header(hold=30) + self.release(sha),
+                             WH_RECV_NAME="r.pdf", WH_RECV_CONTENT="PAYLOAD")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        msgs, payload = self.parse(p.stdout)
+        self.assertEqual([m["status"] for m in msgs],
+                         ["waiting", "held", "payload"])
+        self.assertEqual((msgs[1]["name"], msgs[1]["size"], msgs[1]["sha256"]),
+                         ("r.pdf", 7, sha))
+        self.assertEqual(payload, b"PAYLOAD")
+
+    def test_without_a_matching_release_nothing_is_handed_back(self):
+        for tail in [b"", self.release("0" * 64), b"garbage\n",
+                     b'{"release": true}\n']:
+            with self.subTest(tail=tail):
+                p = self.run_handler("file", header(hold=30) + tail,
+                                     WH_RECV_CONTENT="SECRET")
+                self.assertNotEqual(p.returncode, 0)
+                self.assertNotIn(b"SECRET", p.stdout)
+                msgs, _ = self.parse(p.stdout)
+                self.assertNotIn("payload", [m["status"] for m in msgs])
+                self.assertEqual(msgs[-1]["status"], "error")
+                self.assertIn("discarded", msgs[-1]["message"])
+                self.assertFalse((self.home / "qvm-wormhole-out").exists())
+
+    def test_an_unanswered_hold_times_out_and_discards(self):
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.home),
+               "QREXEC_SERVICE_ARGUMENT": "file",
+               "QREXEC_REMOTE_DOMAIN": "testvm",
+               "WH_TEST_CALLS": str(self.calls),
+               "WORMHOLE_RECV_BIN": str(self.shim),
+               "WH_RECV_CONTENT": "SECRET"}
+        proc = subprocess.Popen([str(HANDLER)], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=env)
+        proc.stdin.write(header(hold=10))
+        proc.stdin.flush()          # and stdin stays open: nobody answers
+        try:
+            proc.wait(timeout=40)   # not communicate(): that closes stdin
+            out = proc.stdout.read()
+        finally:
+            proc.kill()
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.stderr.close()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn(b"SECRET", out)
+        msgs, _ = self.parse(out)
+        self.assertIn("not released within 10s", msgs[-1]["message"])
+        self.assertFalse((self.home / "qvm-wormhole-out").exists())
+
+    def test_a_bad_hold_is_refused_before_wormhole_runs(self):
+        for bad in [0, 9, 4000, True, "30", 1.5]:
+            with self.subTest(bad=bad):
+                p = self.run_handler("file", header(hold=bad))
+                self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.commands(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

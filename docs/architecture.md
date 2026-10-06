@@ -86,7 +86,18 @@ reason the design looks like this:
   would have had to name `@dispvm:<template>` or `@anyvm` as its **source**.
 
 stdout carries newline-delimited JSON status objects, then one `payload` header,
-then exactly `size` raw bytes. The client switches modes at that header's
+then exactly `size` raw bytes.
+
+**The hold.** The client's header carries `hold: <seconds>`. The handler then
+receives and hashes the whole file, sends `{"status":"held", name, size,
+sha256}`, and stops. stdin stays open: only a line `{"release": "<that
+sha256>"}` lets the payload follow. Anything else -- another digest, garbage,
+EOF, or silence past `hold` -- discards the file and ends the call, which
+destroys the disposable. This is what lets the approval gate ask about a file
+whose bytes are still outside the qube: the decision binds to the sha256 the
+disposable measured, and the client refuses a payload that differs from the
+offer or was never held. The handler reads stdin unbuffered (`os.read` on fd 0)
+so the release line cannot be swallowed with the header. The client switches modes at that header's
 newline and reads a declared length rather than to EOF — the same discipline the
 send handler uses on its stdin.
 
